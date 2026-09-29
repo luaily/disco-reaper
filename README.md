@@ -15,16 +15,38 @@ TEST STATISTICS:
 | :--- | :---: | :---: |
 | 2026 SEP 28 | 396 MESSAGES |  0.7s | 
 
+SEE [CHANGELOG](./fork-changelog.md)
 
+## HOW TO USE THIS FORK (BINARIES)
+1. Navigate to this fork's [releases](https://github.com/luaily/disco-reaper/releases) tab 
+2. Select the latest green release (or yellow if you're a risk taker)
+3. Download the version for your OS
+  * Select disco-reaper-linux.zip for **MacOS & Linux**
+    * ON MACOS YOU MUST NAVIGATE TO THE EXTRACTED FOLDER AND RUN `xattr -rd com.apple.quarantine ./DiscoReaper`, CODE IS NOT SIGNED SO IT WILL NOT WORK UNLESS YOU LET IT THROUGH GATEKEEPER.
+  * Select disco-reaper-windows.zip for **Windows**
+    * Windows may throw a blue smartscreen error because the code is unsigned. 
+4. Run the package
+5. Leave a star on this repo (or else it wont work trust!!1!)
+
+## HOW TO USE THIS FORK (CLONING, LATEST UNSTABLE)
+1. **Clone**: Clone the repository to your local machine:
+   ```bash
+   git clone https://github.com/luaily/disco-reaper.git
+   cd disco-reaper
+   ```
+2. **Launch**: Run the appropriate launcher script for your OS. It will automatically create a virtual environment and install dependencies:
+   - **Linux**: `./launch-app.sh`
+   - **MacOS**: `./launch-app-MAC.sh`
+   - **Windows**: Double-click `launch-app-WIN.bat`
+
+
+--------
+# ORIGINAL README.md
 
 **DiscoReaper** is a powerful tool designed to help you migrate your entire Discord server to Fluxer or Stoat. It clones channels, roles, emojis, permissions, and also your community's full message history.
 
-### Get it here: [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://github.com/rambros3d/disco-reaper/releases/latest/download/disco-reaper-linux.zip)   [![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white)](https://github.com/rambros3d/disco-reaper/releases/latest/download/disco-reaper-windows.zip) [![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=F0F0F0)](https://github.com/rambros3d/disco-reaper/releases/latest/download/disco-reaper-macos.zip)
-
-
 >Join our [**Reaper Community**](https://fluxer.gg/9KxDP8WH) if you need help or have any questions.
 
-![Disco Reaper](images/fluxer-reaper.jpg)
 
 ### Video Guide - [Youtube](https://www.youtube.com/watch?v=SwIPQDxLzqA)
 
