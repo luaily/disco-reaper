@@ -1530,6 +1530,7 @@ class OperationPane(Container):
             
             logger.info(f"Execution started for #{source_channel.name} -> {platform_name} @ {target_channel.get('name')}")
             self.engine.is_running = True
+            self._hook_rate_limit_notice(modal)
 
             async def update_msg(current_stats):
                 c_msgs = current_stats["messages"]
@@ -1568,7 +1569,12 @@ class OperationPane(Container):
                 progress_callback=update_msg,
             )
 
-            if self.engine.is_running:
+            if result.get("error"):
+                modal.write(f"[bold red]{result['error']}[/bold red]")
+                modal.write("[yellow]The message was NOT marked as migrated. Choose Continue to retry from it.[/yellow]")
+                event_title = "Message Migration"
+                modal.phase_report(event_title, "error", show_back=False)
+            elif self.engine.is_running:
                 modal.write(f"[bold green]Success! {result['messages']} messages migrated.[/bold green]")
                 event_title = "Message Migration"
                 modal.phase_report(event_title, show_back=False)
@@ -1592,6 +1598,14 @@ class OperationPane(Container):
         finally:
             self.engine.is_running = False
             await self.engine.close_connections()
+
+    def _hook_rate_limit_notice(self, modal) -> None:
+        """Shows writer rate-limit pauses in the progress log (Fluxer writer only)."""
+        writer = getattr(self.engine, "writer", None)
+        if writer is not None and hasattr(writer, "on_rate_limit"):
+            writer.on_rate_limit = lambda secs: modal.write(
+                f"[bold yellow]Rate limited by {self.target_platform.capitalize()} — pausing {max(secs, 1):.0f}s, then resuming the same message...[/bold yellow]"
+            )
 
     @work(exclusive=True)
     async def run_waterfall_migration(self, modal: ProgressScreen | None = None) -> None:
@@ -1739,7 +1753,12 @@ class OperationPane(Container):
                     all_mapped_tgt_ids = filtered_tgt_ids
                 
             # 2.6 Resume Point: Calculate from global channel minimums
-            min_last_id = self.engine.state.get_global_min_last_message_id(all_mapped_tgt_ids)
+            # Prefer the global cursor written by the waterfall itself: it is exactly "everything <= this
+            # ID is handled". The per-channel minimum is only a fallback (e.g. older runs / per-channel
+            # migrations) because an untouched channel makes it 0, which restarts from the top.
+            min_last_id = self.engine.state.get_waterfall_cursor()
+            if min_last_id is None:
+                min_last_id = self.engine.state.get_global_min_last_message_id(all_mapped_tgt_ids)
             
             modal.write(f"\n[bold cyan]Waterfall Migration Resume Point:[/bold cyan]")
             if min_last_id is not None:
@@ -1784,6 +1803,7 @@ class OperationPane(Container):
             modal.set_status("Migrating messages Globally...")
             
             self.engine.is_running = True
+            self._hook_rate_limit_notice(modal)
             
             # Ensure state is initialized (database exists)
             if self.target_platform == "stoat":
@@ -1822,7 +1842,11 @@ class OperationPane(Container):
                 progress_callback=update_msg,
             )
 
-            if self.engine.is_running:
+            if result.get("error"):
+                modal.write(f"[bold red]{result['error']}[/bold red]")
+                modal.write("[yellow]The message was NOT marked as migrated. Choose Continue to retry from it.[/yellow]")
+                modal.phase_report("Waterfall Migration", "error", show_back=False)
+            elif self.engine.is_running:
                 modal.write(f"[bold green]Success! {result['messages']} messages migrated globally.[/bold green]")
                 modal.phase_report("Waterfall Migration", show_back=False)
             else:

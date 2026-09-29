@@ -1,13 +1,49 @@
 import asyncio
 import io
 import logging
-from typing import Optional, List, Dict, Any
+import re
+import time
+from typing import Optional, List, Dict, Any, Callable
 from fluxer import Bot, Webhook, Forbidden, File
 
 logger = logging.getLogger(__name__)
 
+# Number of pause-and-retry rounds after the fluxer HTTP client itself gives up
+# (it retries 429/5xx/connection errors only a few times before raising RuntimeError).
+_MAX_RECOVERY_ROUNDS = 8
+_SEND_TIMEOUT = 45.0
+_RATE_LIMIT_RE = re.compile(r"(?:rate limit(?:ed)?.*?retry in|global rate limit.*?pausing for)\s+([\d.]+)s", re.IGNORECASE)
+
+
+class MessageSendError(Exception):
+    """A message could NOT be delivered for a transient reason (rate limit that never cleared,
+    timeout, outage, cancellation). The caller must stop and must NOT record the message as
+    migrated, so a resume retries it instead of skipping it."""
+
+
+class _RateLimitLogHandler(logging.Handler):
+    """Watches the fluxer HTTP client's own rate-limit warnings so we know when we're paused."""
+
+    def __init__(self, writer: "FluxerWriter"):
+        super().__init__(level=logging.WARNING)
+        self.writer = writer
+
+    def emit(self, record):
+        try:
+            m = _RATE_LIMIT_RE.search(record.getMessage())
+            if m:
+                self.writer._note_rate_limit(float(m.group(1)))
+        except Exception:
+            pass
+
+
 class FluxerWriter:
     def __init__(self, token: str, community_id: str, api_url: str = "default"):
+        # Rate-limit awareness (see _note_rate_limit / _send_with_recovery)
+        self.rate_limited_until: float = 0.0
+        self.on_rate_limit: Optional[Callable[[float], None]] = None  # UI hook: called with seconds to wait
+        self.stop_check: Optional[Callable[[], bool]] = None          # returns True when the run was cancelled
+        self._rl_handler: Optional[_RateLimitLogHandler] = None
         self.token = token
         self.community_id = str(community_id)
         self.api_url = api_url
@@ -78,6 +114,10 @@ class FluxerWriter:
             
         self.bot = Bot(**bot_kwargs)
         self._ready_event.clear()
+
+        if self._rl_handler is None:
+            self._rl_handler = _RateLimitLogHandler(self)
+            logging.getLogger("fluxer.http").addHandler(self._rl_handler)
 
         # Define a simple on_ready listener to signal when we're connected
         @self.bot.event
@@ -280,11 +320,6 @@ class FluxerWriter:
         final_content = prefix + display_content if display_content else prefix
         logger.debug(f"Fluxer: Prepared final_content (len {len(final_content)}): {final_content!r}")
 
-        # Convert files to fluxer.File objects
-        fluxer_files = None
-        if files:
-            fluxer_files = [File(io.BytesIO(f["data"]), filename=f["filename"]) for f in files]
-
         # Normalize embeds (ensure they are dicts, handling fluxer.Embed objects or dicts)
         normalized_embeds = None
         if embeds:
@@ -304,71 +339,137 @@ class FluxerWriter:
                 normalized_embeds.append(d)
         if not normalized_embeds: normalized_embeds = None
 
-        try:
+        def _build_files():
+            # Rebuilt per attempt: BytesIO streams are consumed by a failed upload.
+            if not files:
+                return None
+            return [File(io.BytesIO(f["data"]), filename=f["filename"]) for f in files]
+
+        async def _attempt() -> Optional[str]:
+            fluxer_files = _build_files()
             # Current limitation: fluxer.py execute_webhook doesn't support 'message_reference' yet.
             # So if we have a reply, we MUST use the bot's direct send method.
             if webhook and not reply_to_message_id:
                 logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}'")
-                try:
-                    msg = await asyncio.wait_for(
-                        webhook.send(
-                            content=final_content,
-                            username=f"{author_name} (discord)",
-                            avatar_url=author_avatar_url,
-                            files=fluxer_files,
-                            embeds=normalized_embeds,
-                            wait=True
-                        ),
-                        timeout=45.0 # Increased timeout for potential large file uploads
-                    )
-                    logger.debug(f"Fluxer: Webhook send complete, msg_id={msg.id if msg else 'None'}")
-                    return str(msg.id) if msg else None
-                except asyncio.TimeoutError:
-                    print(f"Fluxer: Webhook send timed out after 45s for channel {channel_id}")
-                    logger.error(f"Fluxer: Webhook send timed out after 45s for channel {channel_id}")
-                    return None
-            else:
-                # Use bot direct message (supports files and message_reference)
-                # We add the author name to the prefix since bot name won't match
-                bot_prefix = f"-# <t:{timestamp}:D>\n"
-                if is_forwarded:
-                    bot_prefix += "-# ⮫*forwarded*\n"
-                bot_prefix += f"-# · {author_name}\n"
-                
-                final_bot_content = bot_prefix + display_content if display_content else bot_prefix
-                
-                message_reference = None
-                if reply_to_message_id:
-                    message_reference = {"message_id": str(reply_to_message_id), "channel_id": str(channel_id)}
+                msg = await webhook.send(
+                    content=final_content,
+                    username=f"{author_name} (discord)",
+                    avatar_url=author_avatar_url,
+                    files=fluxer_files,
+                    embeds=normalized_embeds,
+                    wait=True
+                )
+                return str(msg.id) if msg else None
 
-                logger.debug(f"Fluxer: Sending message via bot for user '{author_name}'")
-                try:
-                    kwargs = {
-                        "channel_id": channel_id,
-                        "content": final_bot_content,
-                        "embeds": normalized_embeds
-                    }
-                    if fluxer_files:
-                        kwargs["files"] = fluxer_files
-                    if message_reference:
-                        kwargs["message_reference"] = message_reference
+            # Use bot direct message (supports files and message_reference)
+            # We add the author name to the prefix since bot name won't match
+            bot_prefix = f"-# <t:{timestamp}:D>\n"
+            if is_forwarded:
+                bot_prefix += "-# ⮫*forwarded*\n"
+            bot_prefix += f"-# · {author_name}\n"
 
-                    msg_data = await asyncio.wait_for(
-                        self.client.send_message(**kwargs),
-                        timeout=45.0
-                    )
-                    logger.debug(f"Fluxer: Bot send complete, msg_id={msg_data.get('id') if msg_data else 'None'}")
-                    return str(msg_data["id"]) if msg_data else None
-                except asyncio.TimeoutError:
-                    print(f"Fluxer: Bot send timed out after 45s for channel {channel_id}")
-                    logger.error(f"Fluxer: Bot send timed out after 45s for channel {channel_id}")
-                    return None
+            final_bot_content = bot_prefix + display_content if display_content else bot_prefix
+
+            kwargs = {
+                "channel_id": channel_id,
+                "content": final_bot_content,
+                "embeds": normalized_embeds
+            }
+            if fluxer_files:
+                kwargs["files"] = fluxer_files
+            if reply_to_message_id:
+                kwargs["message_reference"] = {"message_id": str(reply_to_message_id), "channel_id": str(channel_id)}
+
+            logger.debug(f"Fluxer: Sending message via bot for user '{author_name}'")
+            msg_data = await self.client.send_message(**kwargs)
+            return str(msg_data["id"]) if msg_data else None
+
+        try:
+            return await self._send_with_recovery(_attempt, channel_id)
+        except MessageSendError:
+            raise
         except Exception as e:
-            err_msg = f"Failed to copy message to Fluxer: {e}"
+            # Permanent rejection (e.g. 400/403/413: bad embed, file too large). Retrying can't help,
+            # so log and skip this one message. Returning None means "not sent, don't retry".
+            err_msg = f"Fluxer rejected message for channel {channel_id}: {e}"
             if hasattr(e, 'errors') and e.errors:
                 err_msg += f" - Details: {e.errors}"
             logger.error(err_msg)
             return None
+
+    # ── rate-limit handling ────────────────────────────────────────────────
+
+    def _note_rate_limit(self, seconds: float):
+        """Called (via log handler) whenever the HTTP client reports a 429 / global limit."""
+        self.rate_limited_until = max(self.rate_limited_until, time.monotonic() + seconds)
+        logger.warning(f"Fluxer: rate limited, waiting {seconds:.1f}s")
+        if self.on_rate_limit:
+            try:
+                self.on_rate_limit(seconds)
+            except Exception:
+                pass
+
+    def _rate_limit_remaining(self) -> float:
+        return max(0.0, self.rate_limited_until - time.monotonic())
+
+    def _cancelled(self) -> bool:
+        return bool(self.stop_check and self.stop_check())
+
+    async def _await_with_ratelimit(self, coro) -> Any:
+        """Awaits a send, but only enforces the timeout while we are NOT waiting on a rate limit.
+        (A plain wait_for would cancel a request that is merely sleeping through a 429 pause.)"""
+        task = asyncio.ensure_future(coro)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_SEND_TIMEOUT)
+                if done:
+                    return task.result()
+                if self._cancelled():
+                    raise MessageSendError("Cancelled while sending")
+                if self._rate_limit_remaining() > 0:
+                    continue  # paused by the rate limiter, keep waiting
+                raise MessageSendError(f"Send timed out after {_SEND_TIMEOUT:.0f}s (delivery unknown)")
+        finally:
+            if not task.done():
+                task.cancel()
+
+    async def _send_with_recovery(self, attempt_fn, channel_id: str) -> str:
+        """Runs a send. Rate limits/outages the HTTP client can't ride out are waited out here and the
+        SAME message is retried. Returns the new message id, or raises MessageSendError.
+        Permanent API rejections propagate as their original exception."""
+        for round_ in range(_MAX_RECOVERY_ROUNDS):
+            if self._cancelled():
+                raise MessageSendError("Cancelled")
+            try:
+                msg_id = await self._await_with_ratelimit(attempt_fn())
+                if msg_id:
+                    return msg_id
+                raise MessageSendError(f"Fluxer returned no message id for channel {channel_id}")
+            except MessageSendError:
+                raise
+            except RuntimeError as e:
+                # fluxer.http raises RuntimeError("Failed after N attempts") once its retries are spent
+                if "Failed after" not in str(e):
+                    raise
+                delay = max(self._rate_limit_remaining(), min(60.0, 5.0 * (2 ** round_)))
+                logger.warning(f"Fluxer: send failed after client retries ({e}); pausing {delay:.0f}s then retrying same message")
+                if self.on_rate_limit:
+                    try:
+                        self.on_rate_limit(delay)
+                    except Exception:
+                        pass
+                waited = 0.0
+                while waited < delay:
+                    if self._cancelled():
+                        raise MessageSendError("Cancelled while waiting on rate limit")
+                    await asyncio.sleep(1.0)
+                    waited += 1.0
+            except Exception as e:
+                status = getattr(e, "status", None)
+                if isinstance(status, int) and 400 <= status < 500:
+                    raise  # permanent rejection
+                raise MessageSendError(f"Send failed for channel {channel_id}: {e}") from e
+        raise MessageSendError(f"Gave up sending to channel {channel_id} after {_MAX_RECOVERY_ROUNDS} rate-limit/outage retries")
 
     async def send_marker(self, channel_id: str, content: str, files: list[dict] | None = None, reply_to_message_id: Optional[str] = None) -> Optional[str]:
         """

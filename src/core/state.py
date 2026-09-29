@@ -243,6 +243,23 @@ class MigrationState:
         """Clears all message mapping and tracking state globally."""
         if self._ensure_db():
             self.db.clear_all_migration_data()
+            self.db.set_metadata("waterfall_cursor", "")
+
+    def get_waterfall_cursor(self) -> int | None:
+        """Source message ID of the last message the Waterfall run fully handled (sent, or
+        deliberately skipped). Every message with a lower ID is done. None if never set."""
+        if self.db:
+            val = self.db.get_metadata("waterfall_cursor")
+            if val:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+    def set_waterfall_cursor(self, message_id: int | str):
+        if self._ensure_db():
+            self.db.set_metadata("waterfall_cursor", str(message_id))
             
     def get_all_last_message_ids(self) -> Dict[str, str]:
         """Returns a combined map of channel_id/thread_id -> last_msg_id."""

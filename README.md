@@ -1,5 +1,22 @@
 # DiscoReaper
 
+## EDITED IN THIS FORK VERSION:
+Edited by [@luaily](https://github.com/luaily)  
+This fork creates a heavily tested fix for the `429/rate-limit` error on Fluxer that should gracefully handle rate limits and will freeze the waterfall transfer until rate-limit bucket opens back up, 
+
+FIXES/CHANGES:
+1. FIXED: Messages marked as migrated when they were never delivered (Fluxer)
+2. FIXED: Rate limits were not waited out
+3. FIXED: Resume restarted from the top / duplicated channels
+4. FIXED: Waterfall pre-scan counted already-migrated messages
+
+TEST STATISTICS: 
+| DATE | MESSAGES SENT | HIGHEST RATE-LIMIT TIME ENCOUNTERED |
+| :--- | :---: | :---: |
+| 2026 SEP 28 | 396 MESSAGES |  0.7s | 
+
+
+
 **DiscoReaper** is a powerful tool designed to help you migrate your entire Discord server to Fluxer or Stoat. It clones channels, roles, emojis, permissions, and also your community's full message history.
 
 ### Get it here: [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)](https://github.com/rambros3d/disco-reaper/releases/latest/download/disco-reaper-linux.zip)   [![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white)](https://github.com/rambros3d/disco-reaper/releases/latest/download/disco-reaper-windows.zip) [![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=F0F0F0)](https://github.com/rambros3d/disco-reaper/releases/latest/download/disco-reaper-macos.zip)

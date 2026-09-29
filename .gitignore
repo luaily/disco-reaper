@@ -56,3 +56,10 @@ FLUXER-*/
 REAPER-*/
 EXPORT-*/
 screenshots/
+
+# Live test (secrets + generated data)
+livetest.toml
+livetest-work/
+
+# Luaily's Fork Specific Files
+*.forkbak
