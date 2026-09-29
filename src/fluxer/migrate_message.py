@@ -14,6 +14,7 @@ except ImportError:
     HAS_LOTTIE = False
 
 from src.core.base import MigrationContext
+from src.fluxer.writer import MessageSendError
 from src.core.utils import resolve_discord_links
 
 logger = logging.getLogger(__name__)
@@ -776,6 +777,12 @@ async def migrate_messages(
                 
                 if progress_callback:
                     await progress_callback(stats)
+            except MessageSendError as e:
+                # Not delivered: stop so progress isn't advanced past this message.
+                logger.error(f"Migration halted at message {msg.id}: {e}")
+                stats["error"] = f"Halted at message {msg.id}: {e}"
+                context.is_running = False
+                break
             except Exception as e:
                 logger.error(f"Failed to process message {msg.id}: {e}")
                 import traceback
@@ -819,7 +826,7 @@ async def analyze_global_migration(context: MigrationContext, after_message_id: 
 
         # Efficient skip: if message ID is <= last migrated ID for this channel/thread
         # This is the primary resume mechanism: wait until we pass the last migrated ID for this channel
-        last_id = progress_map.get(str(msg.channel.id))
+        last_id = progress_map.get(str(target_channel_id))
         if last_id and msg.id <= int(last_id):
             continue
             
@@ -929,8 +936,19 @@ async def migrate_global_messages(
                 if progress_callback:
                     await progress_callback(stats)
                     
+            except MessageSendError as e:
+                # Not delivered (rate limit never cleared / timeout / outage). Stop right here WITHOUT
+                # advancing any progress marker so a resume retries this exact message.
+                logger.error(f"Waterfall halted at message {msg.id}: {e}")
+                stats["error"] = f"Halted at message {msg.id}: {e}"
+                context.is_running = False
+                break
             except Exception as e:
                 logger.error(f"Failed to process global message {msg.id}: {e}")
+
+            # Message is fully handled (sent, or deliberately skipped/rejected): everything up to and
+            # including this ID is done. This is the resume point.
+            context.state.set_waterfall_cursor(msg.id)
                 
     except (KeyboardInterrupt, asyncio.CancelledError):
         context.is_running = False

@@ -59,6 +59,8 @@ class MigrationContext:
             self.stoat_writer = StoatWriter(token="", community_id="", api_url="default")
         
         self.is_running = False
+        # Lets the writer abort rate-limit waits when the user cancels
+        self.writer.stop_check = lambda: not self.is_running
 
     def _find_backup_path(self, server_id: str | int | None, base_dir_str: str) -> Path:
         """Searches workspace for a DISCORD_BACKUP-{server_id} directory. Returns the path (does not create)."""
