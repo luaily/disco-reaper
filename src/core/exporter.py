@@ -683,6 +683,13 @@ class DiscordExporter:
 
         return m_data, new_users
 
+    async def resolve_content_links(self, token: str, progress=None, **kwargs) -> dict:
+        """Saves Discord CDN media that was pasted as a link in message text (refresh via the bot token, download,
+        hash, store in the media pool). Safe to re-run: finished links are skipped. See core/media_links.py."""
+        from src.core.media_links import MediaLinkResolver
+        resolver = MediaLinkResolver(self.db, self.export_path, token)
+        return await resolver.resolve_backup(progress=progress, **kwargs)
+
     async def _process_media(self, media_id, url, filename, size=None, content_type=None, save_method=None, data=None):
         """Downloads and deduplicates any media (attachment or sticker) using SHA-256 (CAS)."""
         # 1. First check by URL in DB

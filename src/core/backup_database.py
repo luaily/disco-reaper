@@ -344,6 +344,21 @@ class BackupDatabase:
                     )
                 """)
                 
+                # Discord CDN links pasted in message text -> what happened when we tried to save them (see media_links.py)
+                # key = "<channel>/<attachment>/<filename>"; status: ok | dead | too_large | error
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS link_media (
+                        key TEXT PRIMARY KEY,
+                        status TEXT,
+                        hash TEXT,
+                        filename TEXT,
+                        size INTEGER,
+                        content_type TEXT,
+                        error TEXT,
+                        checked_at TEXT
+                    )
+                """)
+
                 # Server Assets (Emojis, Stickers, etc.)
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS server_assets (
@@ -571,6 +586,44 @@ class BackupDatabase:
         with self._lock:
             row = self._conn.execute("SELECT * FROM media_pool WHERE first_seen_url = ?", (url,)).fetchone()
             return dict(row) if row else None
+
+    def get_link_media(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM link_media WHERE key = ?", (key,)).fetchone()
+            return dict(row) if row else None
+
+    def set_link_media(self, key: str, status: str, hash: Optional[str] = None, filename: Optional[str] = None,
+                       size: Optional[int] = None, content_type: Optional[str] = None, error: Optional[str] = None):
+        """Records the outcome for one CDN link. Commits (also flushing any pending media_pool insert)."""
+        from datetime import datetime, timezone
+        with self._lock:
+            self._conn.execute("""
+                INSERT OR REPLACE INTO link_media (key, status, hash, filename, size, content_type, error, checked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (key, status, hash, filename, size, content_type, error, datetime.now(timezone.utc).isoformat()))
+            self._conn.commit()
+
+    def link_media_counts(self) -> Dict[str, int]:
+        with self._lock:
+            return {r["status"]: r["n"] for r in self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM link_media GROUP BY status").fetchall()}
+
+    def iter_link_candidates(self, batch: int = 2000):
+        """Yields (message_id, content) for messages whose text mentions a Discord CDN attachment URL."""
+        last = 0
+        while True:
+            with self._lock:
+                rows = self._conn.execute("""
+                    SELECT id, content FROM messages
+                    WHERE id > ? AND (content LIKE '%discordapp.com/%attachments/%'
+                                   OR content LIKE '%discordapp.net/%attachments/%')
+                    ORDER BY id ASC LIMIT ?
+                """, (last, batch)).fetchall()
+            if not rows:
+                return
+            for r in rows:
+                yield r["id"], r["content"]
+            last = rows[-1]["id"]
 
     def add_media_to_pool(self, file_hash: str, local_path: str, size: int, content_type: str, url: str):
         # NOTE: No commit here — caller (save_messages_batch) commits at end of batch

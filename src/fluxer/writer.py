@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import logging
 import re
 import time
@@ -13,6 +14,14 @@ logger = logging.getLogger(__name__)
 _MAX_RECOVERY_ROUNDS = 8
 _SEND_TIMEOUT = 45.0
 _RATE_LIMIT_RE = re.compile(r"(?:rate limit(?:ed)?.*?retry in|global rate limit.*?pausing for)\s+([\d.]+)s", re.IGNORECASE)
+
+
+_WEBHOOK_URL_RE = re.compile(r"(/webhooks/\d+/)[^\s/?'\")]+")
+
+
+def _redact(text) -> str:
+    """Strips webhook tokens from error text (the fluxer client embeds the full webhook URL in its errors)."""
+    return _WEBHOOK_URL_RE.sub(r"\1***", str(text))
 
 
 class MessageSendError(Exception):
@@ -43,6 +52,8 @@ class FluxerWriter:
         self.rate_limited_until: float = 0.0
         self.on_rate_limit: Optional[Callable[[float], None]] = None  # UI hook: called with seconds to wait
         self.stop_check: Optional[Callable[[], bool]] = None          # returns True when the run was cancelled
+        self.min_send_interval: float = 0.0   # optional self-imposed pacing (seconds between sends); 0 = off
+        self._last_send_at: float = 0.0
         self._rl_handler: Optional[_RateLimitLogHandler] = None
         self.token = token
         self.community_id = str(community_id)
@@ -345,15 +356,29 @@ class FluxerWriter:
                 return None
             return [File(io.BytesIO(f["data"]), filename=f["filename"]) for f in files]
 
+        # Replies: Fluxer's execute-webhook endpoint accepts `message_reference` (native reply that keeps the
+        # webhook's username/avatar), but fluxer.py's Webhook.send() doesn't expose it, so we call the route directly.
+        # If Fluxer rejects the reference (e.g. the target no longer exists) we retry once without it.
+        can_ref_via_webhook = bool(webhook and reply_to_message_id and hasattr(self.client, "_route"))
+        use_reference = True
+
         async def _attempt() -> Optional[str]:
             fluxer_files = _build_files()
-            # Current limitation: fluxer.py execute_webhook doesn't support 'message_reference' yet.
-            # So if we have a reply, we MUST use the bot's direct send method.
-            if webhook and not reply_to_message_id:
+            if webhook and not (reply_to_message_id and not can_ref_via_webhook):
+                username = f"{author_name} (discord)"
+                if reply_to_message_id and use_reference:
+                    logger.debug(f"Fluxer: Sending reply via webhook {webhook.id} for user '{author_name}'")
+                    return await self._webhook_execute_with_reference(
+                        webhook, content=final_content, username=username, avatar_url=author_avatar_url,
+                        files=files, embeds=normalized_embeds,
+                        message_reference={"message_id": str(reply_to_message_id), "channel_id": str(channel_id)})
                 logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}'")
+                body = final_content
+                if reply_to_message_id:      # reference was rejected: keep a visible trace of the reply
+                    body = "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content
                 msg = await webhook.send(
-                    content=final_content,
-                    username=f"{author_name} (discord)",
+                    content=body,
+                    username=username,
                     avatar_url=author_avatar_url,
                     files=fluxer_files,
                     embeds=normalized_embeds,
@@ -361,7 +386,7 @@ class FluxerWriter:
                 )
                 return str(msg.id) if msg else None
 
-            # Use bot direct message (supports files and message_reference)
+            # No webhook available: use bot direct message (supports files and message_reference)
             # We add the author name to the prefix since bot name won't match
             bot_prefix = f"-# <t:{timestamp}:D>\n"
             if is_forwarded:
@@ -375,8 +400,11 @@ class FluxerWriter:
                 "content": final_bot_content,
                 "embeds": normalized_embeds
             }
-            if fluxer_files:
-                kwargs["files"] = fluxer_files
+            if files:
+                # HTTPClient.send_message (unlike Webhook.send) wants plain {"filename", "data"} dicts and
+                # indexes them as file["filename"] -- passing fluxer.File objects raises
+                # "'File' object is not subscriptable".
+                kwargs["files"] = [{"filename": f["filename"], "data": f["data"]} for f in files]
             if reply_to_message_id:
                 kwargs["message_reference"] = {"message_id": str(reply_to_message_id), "channel_id": str(channel_id)}
 
@@ -384,20 +412,66 @@ class FluxerWriter:
             msg_data = await self.client.send_message(**kwargs)
             return str(msg_data["id"]) if msg_data else None
 
+        await self._pace()
         try:
-            return await self._send_with_recovery(_attempt, channel_id)
+            try:
+                return await self._send_with_recovery(_attempt, channel_id)
+            except MessageSendError:
+                raise
+            except Exception as e:
+                status = getattr(e, "status", None)
+                if can_ref_via_webhook and use_reference and isinstance(status, int) and 400 <= status < 500:
+                    logger.warning(f"Fluxer: reply reference rejected ({status}) for channel {channel_id}; "
+                                   f"retrying without the reply link")
+                    use_reference = False
+                    return await self._send_with_recovery(_attempt, channel_id)
+                raise
         except MessageSendError:
             raise
         except Exception as e:
             # Permanent rejection (e.g. 400/403/413: bad embed, file too large). Retrying can't help,
             # so log and skip this one message. Returning None means "not sent, don't retry".
-            err_msg = f"Fluxer rejected message for channel {channel_id}: {e}"
+            err_msg = f"Fluxer rejected message for channel {channel_id}: {_redact(e)}"
             if hasattr(e, 'errors') and e.errors:
                 err_msg += f" - Details: {e.errors}"
             logger.error(err_msg)
             return None
 
+    async def _webhook_execute_with_reference(self, webhook, *, content, username, avatar_url, files, embeds,
+                                              message_reference) -> Optional[str]:
+        """POST /webhooks/{id}/{token} with a message_reference (native reply as the webhook identity)."""
+        import aiohttp
+        route = self.client._route("POST", "/webhooks/{webhook_id}/{token}", webhook_id=webhook.id, token=webhook.token)
+        payload: Dict[str, Any] = {"content": content, "username": username, "message_reference": message_reference}
+        if avatar_url:
+            payload["avatar_url"] = avatar_url
+        if embeds:
+            payload["embeds"] = embeds
+        params = {"wait": "true"}
+        if files:
+            form = aiohttp.FormData()
+            payload["attachments"] = [{"id": i, "filename": f["filename"]} for i, f in enumerate(files)]
+            form.add_field("payload_json", json.dumps(payload), content_type="application/json")
+            for i, f in enumerate(files):
+                form.add_field(f"files[{i}]", f["data"], filename=f["filename"])
+            res = await self.client.request(route, data=form, params=params)
+        else:
+            res = await self.client.request(route, json=payload, params=params)
+        return str(res["id"]) if res else None
+
     # ── rate-limit handling ────────────────────────────────────────────────
+
+    async def _pace(self):
+        """Optional self-imposed rate cap (min_send_interval seconds between sends), abortable on cancel/deadline."""
+        if self.min_send_interval > 0:
+            while True:
+                wait = self._last_send_at + self.min_send_interval - time.monotonic()
+                if wait <= 0:
+                    break
+                if self._cancelled():
+                    raise MessageSendError("Cancelled while pacing")
+                await asyncio.sleep(min(wait, 1.0))
+        self._last_send_at = time.monotonic()
 
     def _note_rate_limit(self, seconds: float):
         """Called (via log handler) whenever the HTTP client reports a 429 / global limit."""
@@ -452,7 +526,7 @@ class FluxerWriter:
                 if "Failed after" not in str(e):
                     raise
                 delay = max(self._rate_limit_remaining(), min(60.0, 5.0 * (2 ** round_)))
-                logger.warning(f"Fluxer: send failed after client retries ({e}); pausing {delay:.0f}s then retrying same message")
+                logger.warning(f"Fluxer: send failed after client retries ({_redact(e)}); pausing {delay:.0f}s then retrying same message")
                 if self.on_rate_limit:
                     try:
                         self.on_rate_limit(delay)
@@ -468,7 +542,7 @@ class FluxerWriter:
                 status = getattr(e, "status", None)
                 if isinstance(status, int) and 400 <= status < 500:
                     raise  # permanent rejection
-                raise MessageSendError(f"Send failed for channel {channel_id}: {e}") from e
+                raise MessageSendError(f"Send failed for channel {channel_id}: {_redact(e)}") from e
         raise MessageSendError(f"Gave up sending to channel {channel_id} after {_MAX_RECOVERY_ROUNDS} rate-limit/outage retries")
 
     async def send_marker(self, channel_id: str, content: str, files: list[dict] | None = None, reply_to_message_id: Optional[str] = None) -> Optional[str]:
@@ -477,9 +551,10 @@ class FluxerWriter:
         """
         assert self.client is not None
         
-        fluxer_files = None
+        # HTTPClient.send_message takes plain {"filename", "data"} dicts, not fluxer.File objects
+        raw_files = None
         if files:
-            fluxer_files = [f if hasattr(f, "filename") else File(io.BytesIO(f["data"]), filename=f["filename"]) for f in files]
+            raw_files = [f.to_dict() if hasattr(f, "to_dict") else {"filename": f["filename"], "data": f["data"]} for f in files]
         
         message_reference = None
         if reply_to_message_id:
@@ -490,8 +565,8 @@ class FluxerWriter:
                 "channel_id": channel_id,
                 "content": content
             }
-            if fluxer_files:
-                kwargs["files"] = fluxer_files
+            if raw_files:
+                kwargs["files"] = raw_files
             if message_reference:
                 kwargs["message_reference"] = message_reference
 

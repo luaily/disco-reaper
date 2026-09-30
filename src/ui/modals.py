@@ -1020,6 +1020,74 @@ class ChannelNameInputModal(ModalScreen[str | None]):
 
 
 # ---------------------------------------------------------------------------
+# RunOptionsModal – optional stop time and rate cap for long (overnight) runs
+# ---------------------------------------------------------------------------
+
+class RunOptionsModal(ModalScreen[dict | None]):
+    """Asks for an optional stop time and message-rate cap before a long migration starts.
+
+    Dismisses with {"deadline": epoch-seconds | None, "max_rate": messages/minute (0 = unlimited)},
+    or None if the user goes back. Blank fields mean "no limit".
+    """
+
+    DEFAULT_CSS = """
+    RunOptionsModal { align: center middle; }
+    #run_opts_dialog {
+        width: 70%;
+        height: auto;
+        border: solid cyan;
+        padding: 1 2;
+        background: $surface;
+    }
+    #run_opts_dialog Input { margin-bottom: 1; }
+    #run_opts_buttons { height: auto; margin-top: 1; }
+    #run_opts_buttons Button { width: 1fr; margin: 0 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="run_opts_dialog"):
+            yield Label("[bold cyan]Run Options[/bold cyan]")
+            yield Label("[dim]Optional. Leave blank to run until finished. The run always stops between messages,\n"
+                        "so you can resume later exactly where it paused.[/dim]\n")
+            yield Label("Stop at (24h HH:MM) or run for (e.g. 9h, 90m, 9h30m):")
+            yield Input(placeholder="07:00   or   9h   (blank = no limit)", id="input_stop_spec")
+            yield Label("Max speed, messages per minute:")
+            yield Input(placeholder="blank = as fast as the target allows", id="input_max_rate")
+            with Horizontal(id="run_opts_buttons"):
+                yield Button("Start", variant="success", id="btn_run_opts_start")
+                yield Button("Back", id="btn_run_opts_back")
+        yield RamDisplay()
+
+    def _submit(self) -> None:
+        from src.core.utils import parse_stop_spec
+        try:
+            deadline = parse_stop_spec(self.query_one("#input_stop_spec", Input).value)
+        except ValueError as e:
+            self.notify(str(e), severity="warning")
+            return
+        rate_txt = self.query_one("#input_max_rate", Input).value.strip()
+        max_rate = 0.0
+        if rate_txt:
+            try:
+                max_rate = float(rate_txt)
+                if max_rate <= 0:
+                    raise ValueError
+            except ValueError:
+                self.notify("Max speed must be a number greater than 0 (or blank).", severity="warning")
+                return
+        self.dismiss({"deadline": deadline, "max_rate": max_rate})
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn_run_opts_back":
+            self.dismiss(None)
+        elif event.button.id == "btn_run_opts_start":
+            self._submit()
+
+
+# ---------------------------------------------------------------------------
 # ChannelIDInputModal – Input and verify a channel ID
 # ---------------------------------------------------------------------------
 

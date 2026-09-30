@@ -20,9 +20,10 @@ from textual import work
 from src.core.configuration import load_config
 from src.core.base import MigrationContext
 from src.core.audit import log_audit_event
+from src.core.utils import fmt_dur
 from src.core.exporter import DiscordExporter
 from src.ui.modals import (
-    ProgressScreen, SubMenuModal, ChannelPickerScreen, OptionSelectModal, MessageIDInputModal,
+    ProgressScreen, SubMenuModal, ChannelPickerScreen, OptionSelectModal, MessageIDInputModal, RunOptionsModal,
     ChannelSelectScreen
 )
 
@@ -1241,6 +1242,7 @@ class OperationPane(Container):
             self.app.pop_screen()
 
             target_cat_names = {str(c.get("id")): c.get("name") for c in full_f if c.get("type") == 4}
+            run_deadline, run_max_rate = None, 0.0
 
             while True:
                 loop = asyncio.get_running_loop()
@@ -1428,6 +1430,15 @@ class OperationPane(Container):
                     self.engine.is_running = False
                     await self.engine.close_connections()
                     return
+
+                # Optional stop time / rate cap. Asked before anything is cleared; Back returns to the picker.
+                if not is_autotest:
+                    opts = await self._ask_run_options()
+                    if opts is None:
+                        logger.info("User backed out of Run Options.")
+                        modal.dismiss()
+                        continue
+                    run_deadline, run_max_rate = opts["deadline"], opts["max_rate"]
                     
                 after_id = None
                 if choice == "btn_continue" and last_migrated:
@@ -1531,6 +1542,8 @@ class OperationPane(Container):
             logger.info(f"Execution started for #{source_channel.name} -> {platform_name} @ {target_channel.get('name')}")
             self.engine.is_running = True
             self._hook_rate_limit_notice(modal)
+            self._apply_run_options(modal, run_deadline, run_max_rate)
+            run_started = time.time()
 
             async def update_msg(current_stats):
                 c_msgs = current_stats["messages"]
@@ -1541,7 +1554,12 @@ class OperationPane(Container):
                 thr_stat = f"{c_threads}/{total_threads}" if total_threads > 0 else str(c_threads)
                 fil_stat = f"{c_files}/{total_attachments}" if total_attachments > 0 else str(c_files)
 
-                modal.set_item_status(f"[cyan]Migrated {msg_stat} messages...")
+                rate_txt = ""
+                if c_msgs >= 5:
+                    rate = c_msgs / max(1e-6, time.time() - run_started)
+                    eta = f" · ~{fmt_dur((total_messages - c_msgs) / rate)} left" if total_messages > c_msgs and rate > 0 else ""
+                    rate_txt = f" ({rate * 60:.0f} msgs/min{eta})"
+                modal.set_item_status(f"[cyan]Migrated {msg_stat} messages{rate_txt}...")
                 modal.set_progress(c_msgs, total_messages or 100) # Fallback total for bar animation
                 
                 modal.update_stats(
@@ -1574,6 +1592,11 @@ class OperationPane(Container):
                 modal.write("[yellow]The message was NOT marked as migrated. Choose Continue to retry from it.[/yellow]")
                 event_title = "Message Migration"
                 modal.phase_report(event_title, "error", show_back=False)
+            elif result.get("stopped") == "deadline":
+                modal.write(f"[bold yellow]Paused at the scheduled stop time. {result['messages']} messages migrated this session.[/bold yellow]")
+                modal.write("[yellow]Nothing was skipped. Migrate this channel again and choose Continue to resume where it stopped.[/yellow]")
+                event_title = "Message Migration (paused)"
+                modal.phase_report("Message Migration", "stopped", show_back=False)
             elif self.engine.is_running:
                 modal.write(f"[bold green]Success! {result['messages']} messages migrated.[/bold green]")
                 event_title = "Message Migration"
@@ -1597,7 +1620,41 @@ class OperationPane(Container):
             logger.error(f"Migration Error: {traceback.format_exc()}")
         finally:
             self.engine.is_running = False
+            self._reset_run_options()
             await self.engine.close_connections()
+
+    async def _ask_run_options(self) -> dict | None:
+        """Shows the Run Options dialog (optional stop time + rate cap). Returns
+        {"deadline": epoch|None, "max_rate": float}, or None if the user went Back.
+        Fluxer only: that is where the deadline and pacing are implemented; other targets get no limits."""
+        if self.target_platform != "fluxer":
+            return {"deadline": None, "max_rate": 0.0}
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        def cb(res: dict | None) -> None:
+            if not fut.done():
+                fut.set_result(res)
+        self.app.push_screen(RunOptionsModal(), cb)
+        return await fut
+
+    def _apply_run_options(self, modal, deadline: float | None, max_rate: float) -> None:
+        """Arms the stop time / rate cap on the engine for the run that is about to start."""
+        self.engine.deadline = deadline
+        if max_rate and hasattr(self.engine.writer, "min_send_interval"):
+            self.engine.writer.min_send_interval = 60.0 / max_rate
+        if deadline or max_rate:
+            from datetime import datetime
+            parts = []
+            if deadline:
+                parts.append(f"stops at [bold]{datetime.fromtimestamp(deadline):%a %H:%M}[/bold]")
+            if max_rate:
+                parts.append(f"max [bold]{max_rate:g}[/bold] msgs/min")
+            modal.write("[bold cyan]Run options:[/bold cyan] " + ", ".join(parts))
+
+    def _reset_run_options(self) -> None:
+        self.engine.deadline = None
+        if hasattr(self.engine.writer, "min_send_interval"):
+            self.engine.writer.min_send_interval = 0.0
 
     def _hook_rate_limit_notice(self, modal) -> None:
         """Shows writer rate-limit pauses in the progress log (Fluxer writer only)."""
@@ -1789,6 +1846,17 @@ class OperationPane(Container):
                 await self.engine.close_connections()
                 return
                 
+            # Optional stop time / rate cap (Fluxer only: that is where deadline + pacing are implemented).
+            # Asked BEFORE anything is cleared so backing out never wipes progress.
+            run_deadline, run_max_rate = None, 0.0
+            if not is_autotest:
+                opts = await self._ask_run_options()
+                if opts is None:
+                    modal.dismiss()
+                    await self.engine.close_connections()
+                    return
+                run_deadline, run_max_rate = opts["deadline"], opts["max_rate"]
+
             after_id = None
             if choice == "btn_start_first":
                 logger.info("Proceeding with 'Start from Beginning' (global clean sink).")
@@ -1804,6 +1872,7 @@ class OperationPane(Container):
             
             self.engine.is_running = True
             self._hook_rate_limit_notice(modal)
+            self._apply_run_options(modal, run_deadline, run_max_rate)
             
             # Ensure state is initialized (database exists)
             if self.target_platform == "stoat":
@@ -1820,6 +1889,8 @@ class OperationPane(Container):
             modal.write(f"[bold cyan]Global Migration Started:[/bold cyan] {total_messages} total messages to process.")
             modal.update_stats(messages=f"0/{total_messages}", threads=str(stats_analysis["threads"]), files=str(stats_analysis["attachments"]))
             
+            run_started = time.time()
+
             async def update_msg(current_stats):
                 c_msgs = current_stats["messages"]
                 c_threads = current_stats["threads"]
@@ -1828,6 +1899,10 @@ class OperationPane(Container):
                 msg_stat = f"{c_msgs}/{total_messages}" if total_messages > 0 else str(c_msgs)
                 modal.set_progress(c_msgs, total_messages or 100)
                 modal.update_stats(messages=msg_stat, threads=str(c_threads), files=str(c_files))
+                if c_msgs >= 5:
+                    rate = c_msgs / max(1e-6, time.time() - run_started)
+                    eta = f" · ~{fmt_dur((total_messages - c_msgs) / rate)} left" if total_messages > c_msgs and rate > 0 else ""
+                    modal.set_item_status(f"[cyan]{rate * 60:.0f} msgs/min{eta}[/cyan]")
                 
                 content = current_stats.get("last_message_content", "")
                 author = current_stats.get("last_message_author", "Unknown")
@@ -1846,6 +1921,10 @@ class OperationPane(Container):
                 modal.write(f"[bold red]{result['error']}[/bold red]")
                 modal.write("[yellow]The message was NOT marked as migrated. Choose Continue to retry from it.[/yellow]")
                 modal.phase_report("Waterfall Migration", "error", show_back=False)
+            elif result.get("stopped") == "deadline":
+                modal.write(f"[bold yellow]Paused at the scheduled stop time. {result['messages']} messages migrated this session.[/bold yellow]")
+                modal.write("[yellow]Nothing was skipped. Run Waterfall again and choose Continue to resume where it stopped.[/yellow]")
+                modal.phase_report("Waterfall Migration", "stopped", show_back=False)
             elif self.engine.is_running:
                 modal.write(f"[bold green]Success! {result['messages']} messages migrated globally.[/bold green]")
                 modal.phase_report("Waterfall Migration", show_back=False)
@@ -1853,7 +1932,7 @@ class OperationPane(Container):
                 modal.write(f"[bold yellow]Interrupted! {result['messages']} messages migrated.[/bold yellow]")
                 modal.phase_report("Waterfall Migration", "stopped", show_back=False)
                 
-            lines = [f"Migrated Server Globally → {platform_name}:"]
+            lines = [f"{'Paused (scheduled stop time) while migrating' if result.get('stopped') == 'deadline' else 'Migrated'} Server Globally → {platform_name}:"]
             lines.append(f"{result['messages']} messages, {result['attachments']} attachments, {result['threads']} threads")
             await log_audit_event(self.engine, "Waterfall Migration", "\n".join(lines))
 
@@ -1865,6 +1944,7 @@ class OperationPane(Container):
             logger.error(traceback.format_exc())
         finally:
             self.engine.is_running = False
+            self._reset_run_options()
             await self.engine.close_connections()
 
     # ── (6) danger zone ───────────────────────────────────────────────────
@@ -2394,6 +2474,27 @@ class OperationPane(Container):
         finally:
             await self.engine.close_connections()
 
+    async def _resolve_media_links_step(self, modal) -> None:
+        """After a backup/sync: save Discord CDN media that was pasted as a link in message text (refresh via the
+        bot token, download, hash, dedupe into the media pool). Best-effort: never fails the backup."""
+        token = getattr(self.engine.discord_reader, "token", None)
+        db = getattr(self.exporter, "db", None)
+        if not token or db is None or not getattr(self.exporter, "is_running", True):
+            return
+        try:
+            from src.core.media_links import summarize
+            modal.set_status("Saving media pasted as links...")
+
+            async def prog(st):
+                modal.set_item_status(f"[cyan]Media links {st['done']}/{st['total']} (saved {st['ok']}, dead {st['dead']})[/cyan]")
+
+            stats = await self.exporter.resolve_content_links(token, progress=prog)
+            if stats["distinct"]:
+                modal.write("[bold cyan]Media links:[/bold cyan] " + summarize(stats))
+        except Exception as e:
+            logger.warning(f"Media link pass skipped: {e}\n{traceback.format_exc()}")
+            modal.write(f"[yellow]Media link pass skipped: {e}[/yellow]")
+
     async def _logic_full_backup(self, modal: ProgressScreen, selected_channels: list, force_overwrite: bool, is_autotest: bool = False) -> None:
         """Non-interactive core backup logic."""
         if not self.exporter.is_running:
@@ -2435,6 +2536,7 @@ class OperationPane(Container):
                 modal.write(f"[green]Completed: #{chan.name}[/green]")
 
             modal.set_progress(total_chans, total_chans)
+            await self._resolve_media_links_step(modal)
             modal.write("[bold green]Backup complete![/bold green]")
             modal.phase_report("Full Backup", show_back=False)
 
@@ -2497,6 +2599,7 @@ class OperationPane(Container):
             modal_prog.set_progress(total_chans, total_chans)
             modal_prog.set_item_status("[bold green]Backup completed successfully![/bold green]")
 
+            await self._resolve_media_links_step(modal_prog)
             await self.exporter.export_metadata()
             modal_prog.write("[bold green]Message backup complete![/bold green]")
             logger.info("Message backup operation completed successfully.")
@@ -2640,6 +2743,7 @@ class OperationPane(Container):
                 modal_prog.set_progress(total_chans, total_chans)
                 modal_prog.set_item_status("[bold green]Sync operation complete![/bold green]")
 
+            await self._resolve_media_links_step(modal_prog)
             await self.exporter.export_metadata()
             modal_prog.write("[bold green]Sync operation complete![/bold green]")
             logger.info("Sync operation completed successfully.")

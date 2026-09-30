@@ -15,6 +15,7 @@ except ImportError:
 
 from src.core.base import MigrationContext
 from src.fluxer.writer import MessageSendError
+from src.core.media_links import attach_link_media, embed_refs_link
 from src.core.utils import resolve_discord_links
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,18 @@ def clean_mentions(content: str, guild, user_mentions=None, role_mentions=None, 
         content = resolve_discord_links(content, state, "fluxer", target_server_id)
 
     return content
+
+
+def format_reply_fallback(ref_text: str, ref_name: str, has_attachments: bool = False, max_len: int = 160) -> str:
+    """Quote block + 'replying to' header, used when the replied-to message can't be linked natively
+    (it was never migrated, was skipped, or the reference was rejected)."""
+    snippet = " ".join((ref_text or "").split())                # collapse newlines / runs of whitespace
+    snippet = snippet.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")   # never ping from a quote
+    if not snippet:
+        snippet = "[attachment]" if has_attachments else "[message]"
+    if len(snippet) > max_len:
+        snippet = snippet[:max_len - 1].rstrip() + "…"
+    return f"> {snippet}\n-# ↳ replying to `@{ref_name}`\n"
 
 
 async def get_channel_threads(reader: Any, channel_id: int) -> List[Any]:
@@ -291,7 +304,17 @@ async def _process_and_send_message(
                 source_ref_msg = await context.discord_reader.get_message(msg.channel.id, msg.reference.message_id)
                 if source_ref_msg and source_ref_msg.author:
                     ref_name = context.state.get_user_alias(str(source_ref_msg.author.id)) if anonymize_users else source_ref_msg.author.display_name
-                    content = f"`@{ref_name}`\n{content}"
+                    try:
+                        ref_text = clean_mentions(
+                            source_ref_msg.content or "", context.discord_reader.guild,
+                            source_ref_msg.mentions, source_ref_msg.role_mentions, source_ref_msg.channel_mentions,
+                            context.state.emoji_map, context.state.channel_map, state=context.state,
+                            target_server_id=context.fluxer_writer.community_id,
+                            channel_names=context.channel_names if hasattr(context, 'channel_names') else None,
+                            anonymize_users=anonymize_users)
+                    except Exception:
+                        ref_text = source_ref_msg.content or ""
+                    content = format_reply_fallback(ref_text, ref_name, bool(source_ref_msg.attachments)) + content
                 else:
                     tgt_reply = context.state.get_target_message_id(target_channel_id, msg.reference.message_id)
                     if tgt_reply: content = f"[Reply to {tgt_reply}]\n{content}"
@@ -311,19 +334,42 @@ async def _process_and_send_message(
         author_name = msg.author.display_name
         author_avatar_url = msg.author.avatar.url if hasattr(msg.author, 'avatar') and msg.author.avatar else None
 
-    fluxer_msg_id = await context.fluxer_writer.send_message(
-        channel_id=target_channel_id,
-        author_name=author_name,
-        author_avatar_url=author_avatar_url,
-        content=content,
-        timestamp=int(msg.created_at.timestamp()),
-        files=files if files else None,
-        reply_to_message_id=reply_to_fluxer_id,
-        is_forwarded=is_forwarded,
-        embeds=msg.embeds
-    )
+    # Discord CDN links pasted in the text (already refreshed + saved by the backup's media-link pass) become real
+    # attachments; unresolved/dead links stay as text. Backup source only (needs the local media pool).
+    send_content, send_files, send_embeds, link_files = content, list(files), msg.embeds, []
+    r_db, r_root = getattr(context.discord_reader, "db", None), getattr(context.discord_reader, "backup_path", None)
+    if r_db is not None and r_root is not None and hasattr(r_db, "get_link_media"):
+        try:
+            new_content, link_files, replaced = attach_link_media(content, r_db, r_root, max_files=max(0, 10 - len(files)))
+            if link_files:
+                send_content, send_files = new_content, files + link_files
+                send_embeds = [e for e in msg.embeds if not embed_refs_link(e, replaced)]
+        except Exception as e:
+            logger.warning(f"Message {msg.id}: could not attach saved media links ({e}); leaving links as text")
+            send_content, send_files, send_embeds, link_files = content, list(files), msg.embeds, []
 
+    def _send(c, f, em):
+        return context.fluxer_writer.send_message(
+            channel_id=target_channel_id,
+            author_name=author_name,
+            author_avatar_url=author_avatar_url,
+            content=c,
+            timestamp=int(msg.created_at.timestamp()),
+            files=f if f else None,
+            reply_to_message_id=reply_to_fluxer_id,
+            is_forwarded=is_forwarded,
+            embeds=em
+        )
+
+    fluxer_msg_id = await _send(send_content, send_files, send_embeds)
+    if not fluxer_msg_id and link_files:
+        # Fluxer refused the message (e.g. an attachment over its size limit): retry with the original links as text
+        logger.warning(f"Message {msg.id}: rejected with saved media attached; retrying with the links as text")
+        link_files = []
+        fluxer_msg_id = await _send(content, files, msg.embeds)
     if fluxer_msg_id:
+        files = files + link_files
+        stats["attachments"] += len(link_files)
         if thread_id:
             context.state.set_thread_message_mapping(target_channel_id, thread_id, str(msg.id), fluxer_msg_id)
             context.state.update_thread_last_message_timestamp(target_channel_id, thread_id, str(msg.created_at))
@@ -507,6 +553,10 @@ async def migrate_messages(
                 stats["messages"] += thread_stats["messages"]
                 stats["attachments"] += thread_stats["attachments"]
                 stats["threads"] += thread_stats["threads"]
+                # A halt/deadline inside a thread must surface on the parent so the UI reports it (not "Interrupted")
+                for _k in ("error", "stopped"):
+                    if thread_stats.get(_k):
+                        stats.setdefault(_k, thread_stats[_k])
                 
                 if context.is_running:
                     await context.fluxer_writer.send_marker(
@@ -523,6 +573,11 @@ async def migrate_messages(
         async for msg in context.discord_reader.fetch_message_history(source_channel_id, after_id=after_message_id, inclusive=inclusive):
             if not context.is_running:
                 logger.warning("Migration interrupted by user (is_running=False)")
+                break
+            if context.deadline_reached():
+                logger.info("Migration reached its scheduled stop time; stopping cleanly.")
+                stats["stopped"] = "deadline"
+                context.is_running = False
                 break
                 
 
@@ -566,6 +621,10 @@ async def migrate_messages(
                         stats["messages"] += thread_stats["messages"]
                         stats["attachments"] += thread_stats["attachments"]
                         stats["threads"] += thread_stats["threads"]
+                        # A halt/deadline inside a thread must surface on the parent so the UI reports it (not "Interrupted")
+                        for _k in ("error", "stopped"):
+                            if thread_stats.get(_k):
+                                stats.setdefault(_k, thread_stats[_k])
     
                         # Send End Marker
                         if context.is_running:
@@ -763,6 +822,10 @@ async def migrate_messages(
                         stats["messages"] += thread_stats["messages"]
                         stats["attachments"] += thread_stats["attachments"]
                         stats["threads"] += thread_stats["threads"]
+                        # A halt/deadline inside a thread must surface on the parent so the UI reports it (not "Interrupted")
+                        for _k in ("error", "stopped"):
+                            if thread_stats.get(_k):
+                                stats.setdefault(_k, thread_stats[_k])
                         
                         if context.is_running:
                             await context.fluxer_writer.send_marker(
@@ -779,9 +842,13 @@ async def migrate_messages(
                     await progress_callback(stats)
             except MessageSendError as e:
                 # Not delivered: stop so progress isn't advanced past this message.
-                logger.error(f"Migration halted at message {msg.id}: {e}")
-                stats["error"] = f"Halted at message {msg.id}: {e}"
                 context.is_running = False
+                if context.deadline_reached():
+                    logger.info(f"Scheduled stop time reached while sending message {msg.id}; it was not marked migrated.")
+                    stats["stopped"] = "deadline"
+                else:
+                    logger.error(f"Migration halted at message {msg.id}: {e}")
+                    stats["error"] = f"Halted at message {msg.id}: {e}"
                 break
             except Exception as e:
                 logger.error(f"Failed to process message {msg.id}: {e}")
@@ -841,6 +908,11 @@ async def analyze_global_migration(context: MigrationContext, after_message_id: 
             context.discord_reader.MESSAGE_TYPE_AUTO_MODERATION_ACTION
         ]:
             continue
+
+        # Messages with nothing to send (no text, files, stickers or forwarded snapshot) are skipped by
+        # _process_and_send_message, so don't count them (keeps totals / ETAs honest).
+        if not (msg.content or msg.attachments or getattr(msg, 'stickers', None) or getattr(msg, 'message_snapshots', None)):
+            continue
             
         stats["messages"] += 1
         stats["attachments"] += len(msg.attachments)
@@ -887,6 +959,11 @@ async def migrate_global_messages(
         async for msg in context.discord_reader.fetch_global_message_history(after_id=after_message_id):
             if not context.is_running:
                 logger.warning("Global migration interrupted by user")
+                break
+            if context.deadline_reached():
+                logger.info("Global migration reached its scheduled stop time; stopping cleanly.")
+                stats["stopped"] = "deadline"
+                context.is_running = False
                 break
                 
             if msg.type not in [
@@ -937,11 +1014,15 @@ async def migrate_global_messages(
                     await progress_callback(stats)
                     
             except MessageSendError as e:
-                # Not delivered (rate limit never cleared / timeout / outage). Stop right here WITHOUT
+                # Not delivered (rate limit never cleared / timeout / outage / deadline). Stop right here WITHOUT
                 # advancing any progress marker so a resume retries this exact message.
-                logger.error(f"Waterfall halted at message {msg.id}: {e}")
-                stats["error"] = f"Halted at message {msg.id}: {e}"
                 context.is_running = False
+                if context.deadline_reached():
+                    logger.info(f"Scheduled stop time reached while sending message {msg.id}; it was not marked migrated.")
+                    stats["stopped"] = "deadline"
+                else:
+                    logger.error(f"Waterfall halted at message {msg.id}: {e}")
+                    stats["error"] = f"Halted at message {msg.id}: {e}"
                 break
             except Exception as e:
                 logger.error(f"Failed to process global message {msg.id}: {e}")

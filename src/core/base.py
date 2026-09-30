@@ -59,8 +59,16 @@ class MigrationContext:
             self.stoat_writer = StoatWriter(token="", community_id="", api_url="default")
         
         self.is_running = False
-        # Lets the writer abort rate-limit waits when the user cancels
-        self.writer.stop_check = lambda: not self.is_running
+        # Optional wall-clock stop time (epoch seconds) for timed / overnight runs. Checked between messages,
+        # and by the writer so a rate-limit wait never runs past it.
+        self.deadline: float | None = None
+        # Lets the writer abort rate-limit waits when the user cancels or the deadline passes
+        self.writer.stop_check = lambda: (not self.is_running) or self.deadline_reached()
+
+    def deadline_reached(self) -> bool:
+        """True once the optional run deadline (epoch seconds) has passed."""
+        import time
+        return self.deadline is not None and time.time() >= self.deadline
 
     def _find_backup_path(self, server_id: str | int | None, base_dir_str: str) -> Path:
         """Searches workspace for a DISCORD_BACKUP-{server_id} directory. Returns the path (does not create)."""

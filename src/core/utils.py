@@ -104,3 +104,45 @@ def get_app_version() -> str:
         return f"Reaper-{version}"
     except Exception:
         return "Reaper-Unknown-git"
+
+
+# ── run-window helpers (used by the TUI run-options dialog and scripts/timed_waterfall.py) ──
+
+def parse_until(text: str, now=None) -> float:
+    """'HH:MM' (24h, local time) -> epoch seconds of its next occurrence (tomorrow if already past)."""
+    from datetime import datetime, timedelta
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text.strip())
+    if not m:
+        raise ValueError(f"Stop time must be HH:MM (24h), got {text!r}")
+    now = now or datetime.now()
+    t = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+    if t <= now:
+        t += timedelta(days=1)
+    return t.timestamp()
+
+
+def parse_duration(text: str) -> float:
+    """'9h', '90m', '9h30m', '45s' -> seconds."""
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text.strip().lower())
+    if not m or not any(m.groups()):
+        raise ValueError(f"Duration must look like 9h, 90m, 9h30m or 45s, got {text!r}")
+    return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0)
+
+
+def fmt_dur(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def parse_stop_spec(text: str, now_ts: float | None = None) -> float | None:
+    """Stop-time field: blank -> None (no limit); 'HH:MM' -> next occurrence; '9h30m'/'90m'/'45s' -> now + duration.
+    Returns an epoch-seconds deadline."""
+    import time as _time
+    text = (text or "").strip()
+    if not text:
+        return None
+    if ":" in text:
+        return parse_until(text)
+    return (now_ts if now_ts is not None else _time.time()) + parse_duration(text)
