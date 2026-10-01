@@ -52,35 +52,36 @@ Legend: `async` = coroutine. Methods are listed under their class. "Src" = the D
 ### `core/base.py`
 - `class MigrationContext` :14 — holds config, target platform, source mode (live/backup), the reader, writer, and state; the object passed to every operation.
   - `__init__` :17 — builds reader/writer by platform and mode; sets `is_running=False` (loops exit immediately until a caller sets it `True`) adds the optional `deadline` (epoch seconds; `None` = no limit) and wires `writer.stop_check` so rate-limit waits and pacing abort on cancel **or** once the deadline passes.
-  - `deadline_reached()` :68 — NEW; `True` once `deadline` has passed (checked between messages by the migrate loops).
-  - `_find_backup_path(server_id, base_dir_str)` :73 — locates a `DISCORD_BACKUP-{id}` folder.
-  - `async validate_all()` :97 — connection/permission validation status dict for source and target.
-  - `ensure_state_initialized(community_id, community_name)` :140 — creates/opens the `MigrationState` DB in the correctly named folder.
-  - `async start_connections()` :174 — starts reader and writer.
-  - `async start_target_only()` :178 — starts only the writer (Danger Zone).
-  - `async close_connections()` :182 — closes reader and writer.
-  - `async close_target_only()` :192 — closes only the writer.
-  - `stop()` :200 — sets `is_running=False` to cancel work.
+  - `deadline_reached()` :70 — NEW; `True` once `deadline` has passed (checked between messages by the migrate loops).
+  - `_find_backup_path(server_id, base_dir_str)` :75 — locates a `DISCORD_BACKUP-{id}` folder.
+  - `async validate_all()` :99 — connection/permission validation status dict for source and target.
+  - `ensure_state_initialized(community_id, community_name)` :142 — creates/opens the `MigrationState` DB in the correctly named folder.
+  - `async start_connections()` :176 — starts reader and writer.
+  - `async start_target_only()` :180 — starts only the writer (Danger Zone).
+  - `async close_connections()` :184 — closes reader and writer.
+  - `async close_target_only()` :194 — closes only the writer.
+  - `stop()` :202 — sets `is_running=False` to cancel work.
 
 ### `core/configuration.py`
-- `class AppConfig` :6 — dataclass of per-profile settings (tokens, server IDs, mode, platform, log level).
-- `load_config(config_path, create_if_missing)` :20 — reads a profile's config file.
-- `save_config(config, config_path)` :39 — writes it.
-- `get_available_configs()` :45 — lists profile names.
-- `create_new_config(name)` :59 — creates a profile folder with a default config.
+- `class AppConfig` :6 — dataclass of per-profile settings (tokens, server IDs, mode, platform, log level, `anonymize_users`, **`max_message_attempts`** = send tries per message before it is skipped, default 5, 0 = never skip; editable on the Configuration screen).
+- `load_config(config_path, create_if_missing)` :21 — reads a profile's config file.
+- `save_config(config, config_path)` :40 — writes it.
+- `get_available_configs()` :46 — lists profile names.
+- `create_new_config(name)` :60 — creates a profile folder with a default config.
 
 ### `core/database.py` — `MigrationDatabase` (SQLite mappings + progress)
 - `class MigrationDatabase` :14
   - `__init__(db_path, platform)` :20; `_get_conn()` :26 — connection helper; `_init_db()` :32 — creates tables / handles migrations per platform.
-  - Message maps: `set_message_mapping` :226, `get_target_message_id` :234, `get_all_message_mappings` :245 — Discord msg ID ↔ target msg ID per channel.
-  - User aliases (anonymize mode): `_generate_alias` :257 — unique `{Adjective}{Name}` from `random_users.json`; `get_or_create_user_alias` :291.
-  - Server entity maps (channels/roles/categories): `set_server_mapping` :326, `get_server_mapping` :334, `get_all_server_mappings` :345, `delete_server_mapping` :355, `clear_server_mappings` :363.
-  - Asset maps (emoji/sticker): `set_asset_mapping` :373, `get_asset_mapping` :381, `get_all_asset_mappings` :392, `delete_asset_mapping` :402, `clear_asset_mappings` :410.
-  - Metadata KV: `set_metadata` :420, `get_metadata` :425.
-  - Channel progress: `update_channel_tracking` :430 (last msg id/ts + counters), `get_channel_tracking` :447, `get_global_min_last_message_id` :455 (min progress across channels — **Waterfall resume point**).
-  - Thread maps/progress: `set_thread_message_mapping` :498, `get_target_thread_message_id` :506, `update_thread_tracking` :517, `get_thread_tracking` :535.
-  - Progress maps: `get_all_channel_tracking_ids` :542, `get_all_thread_tracking_ids` :548 — channel/thread → last msg ID.
-  - Cleanup: `clear_channel_data` :554, `clear_all_migration_data` :563, `close` :573.
+  - Message maps: `set_message_mapping` :246, `get_target_message_id` :254, `get_all_message_mappings` :265 — Discord msg ID ↔ target msg ID per channel.
+  - User aliases (anonymize mode): `_generate_alias` :277 — unique `{Adjective}{Name}` from `random_users.json`; `get_or_create_user_alias` :311.
+  - Server entity maps (channels/roles/categories): `set_server_mapping` :346, `get_server_mapping` :354, `get_all_server_mappings` :365, `delete_server_mapping` :375, `clear_server_mappings` :383.
+  - Asset maps (emoji/sticker): `set_asset_mapping` :393, `get_asset_mapping` :401, `get_all_asset_mappings` :412, `delete_asset_mapping` :422, `clear_asset_mappings` :430.
+  - Metadata KV: `set_metadata` :440, `get_metadata` :445.
+  - Channel progress: `update_channel_tracking` :450 (last msg id/ts + counters), `get_channel_tracking` :467, `get_global_min_last_message_id` :475 (min progress across channels — **Waterfall resume point**).
+  - Thread maps/progress: `set_thread_message_mapping` :518, `get_target_thread_message_id` :526, `update_thread_tracking` :537, `get_thread_tracking` :555.
+  - Progress maps: `get_all_channel_tracking_ids` :562, `get_all_thread_tracking_ids` :568 — channel/thread → last msg ID.
+  - **NEW** failed sends: tables `message_attempts` + `skipped_messages`; `get_message_attempts` :596, `record_message_attempt` :600, `clear_message_attempts` :612, `record_skipped_message` :617, `get_skipped_messages` :627 (all cleared by `clear_all_migration_data`).
+  - Cleanup: `clear_channel_data` :574, `clear_all_migration_data` :583, `close` :630.
 
 ### `core/state.py` — `MigrationState` (facade over `MigrationDatabase`)
 - `class MigrationState` :11 — resumable state; most methods are thin wrappers, many with legacy alias names.
@@ -91,13 +92,14 @@ Legend: `async` = coroutine. Methods are listed under their class. "Src" = the D
   - Emoji: `set_emoji_mapping` :101, `get_emoji_mapping` :106, `remove_emoji_mapping` :111.
   - Stickers: `set_sticker_mapping` :120, `get_sticker_mapping` :125, `remove_sticker_mapping` :130.
   - Properties returning full maps: `channel_map` :140, `category_map` :144, `role_map` :148, `emoji_map` :152, `sticker_map` :156; `audit_log_channel` getter :160 / setter :164.
-  - Messages: `set_target_message_mapping` :170, `get_target_message_id` :174, `set_message_mapping` :179, `get_fluxer_message_id` :182 (legacy), `find_message_mapping` :277 (look up by Discord ID across channels).
-  - Stats/threads: `increment_stats` :185, `increment_thread_stats` :189, `set_thread_message_mapping` :193, `update_thread_last_message_timestamp` :197, `update_thread_last_message_id` :201, `update_thread_completed` :205, `is_thread_completed` :209, `get_thread_message_id` :215, `get_thread_last_message_id` :272.
+  - Messages: `set_target_message_mapping` :170, `get_target_message_id` :174, `set_message_mapping` :179, `get_fluxer_message_id` :182 (legacy), `find_message_mapping` :295 (look up by Discord ID across channels).
+  - Stats/threads: `increment_stats` :185, `increment_thread_stats` :189, `set_thread_message_mapping` :193, `update_thread_last_message_timestamp` :197, `update_thread_last_message_id` :201, `update_thread_completed` :205, `is_thread_completed` :209, `get_thread_message_id` :215, `get_thread_last_message_id` :290.
   - Channel progress: `update_last_message_timestamp` :220, `update_last_message_id` :224, `get_last_message_id` :228.
-  - Waterfall/resume: **`get_waterfall_cursor` :248 / `set_waterfall_cursor` :260** (NEW — global "everything ≤ this source message ID is handled" cursor, stored as `waterfall_cursor` in the DB `metadata` table; preferred resume point), `get_global_min_last_message_id` :235 (fallback), `get_all_last_message_ids` :264, `clear_all_migration_data` :242 (also resets the cursor).
-  - Clearing: `clear_channel_mappings` :291, `clear_role_mappings` :296, `clear_asset_mappings` :300, `clear_message_history` :305, `clear_channel_data` :314.
-  - `set_folder(server_id, clean_name, platform, base_dir)` :318 — creates the per-server state folder and opens its DB.
-  - `get_user_alias(user_id)` :357 — alias via the DB; `load` :364 / `save_state` :365 — no-op compatibility.
+  - **NEW** failed sends: `get_message_attempts` :249, `record_message_attempt` :252, `clear_message_attempts` :255, `record_skipped_message` :259, `get_skipped_messages` :263.
+  - Waterfall/resume: **`get_waterfall_cursor` :266 / `set_waterfall_cursor` :278** (NEW — global "everything ≤ this source message ID is handled" cursor, stored as `waterfall_cursor` in the DB `metadata` table; preferred resume point), `get_global_min_last_message_id` :235 (fallback), `get_all_last_message_ids` :282, `clear_all_migration_data` :242 (also resets the cursor).
+  - Clearing: `clear_channel_mappings` :309, `clear_role_mappings` :314, `clear_asset_mappings` :318, `clear_message_history` :323, `clear_channel_data` :332.
+  - `set_folder(server_id, clean_name, platform, base_dir)` :336 — creates the per-server state folder and opens its DB.
+  - `get_user_alias(user_id)` :375 — alias via the DB; `load` :382 / `save_state` :383 — no-op compatibility.
   - Note: for Fluxer, `get_*_mapping`/`get_target_*_id` return **`int`** (the DB column is INTEGER); compare with `str(...)` against API IDs.
 
 ### `core/utils.py`
@@ -171,17 +173,18 @@ Discord signs/expires CDN attachment URLs; a bot token can refresh them (`POST /
 ## `src/fluxer/` — Fluxer target (mirrored by `src/stoat/`)
 
 ### `fluxer/writer.py` — `FluxerWriter` (REST/bot client)
-- **NEW** `class MessageSendError` :27 — raised when a message could not be delivered for a transient reason; callers must halt and not mark the message migrated.
+- **NEW** `class MessageSendError` :37 — raised when a message could not be delivered for a transient reason; callers must halt and not mark the message migrated.
+- **NEW** `class SendTimeout(MessageSendError)` :43 — a send timed out with no rate limit active (delivery unknown). The timeout now scales with the payload (`_upload_timeout`: 45s + ~1s per 100 KB, capped at 900s) and, after a timeout, `_find_delivered` :467 looks for the message in the channel (same webhook name + exact body, bounded by snowflake time) so a retry doesn't post a duplicate.
 - **NEW** `_redact(text)` :22 — strips webhook tokens (`/webhooks/<id>/<token>`) from error text before it is logged or raised; the fluxer client embeds the full webhook URL in its errors.
-- **NEW** `class _RateLimitLogHandler` :33 (`__init__` :36, `emit` :40) — parses the `fluxer.http` logger's `Rate limited on …, retry in Ns` / `Global rate limit hit, pausing for Ns` warnings into `writer._note_rate_limit`.
-- `class FluxerWriter` :49 — `__init__` :36 (now also sets `rate_limited_until`, `on_rate_limit`, `stop_check`), static `fetch_guilds(token, api_url)` :68, `_get_or_create_webhook` :90, `start` :115 (inner `on_ready` :135; attaches the rate-limit log handler), `client` :148, `validate` :152, `close` :893.
-- Channels: `create_channel` :237, `modify_channel` :259, `move_channel` :284, `get_channels` :290.
-- Messages: `send_message` :298 (webhook impersonation: author name/avatar, files, reply, forward, embeds; inner `_build_files` :353 and `_attempt` :365; returns the message ID, `None` only for a permanent 4xx rejection, raises `MessageSendError` otherwise; webhook path passes `fluxer.File` objects, **the bot path (now only used when no webhook can be created) must pass plain `{"filename","data"}` dicts** because `HTTPClient.send_message` indexes them). **Replies** with a webhook available go through `_webhook_execute_with_reference` (native reply, keeps the migrated user's name/avatar); a 4xx on the reference (e.g. target gone) retries once via `Webhook.send` with an "in reply to a message that could not be linked" note, `send_marker` :548 (bot-posted thread start/end markers; still returns `None` on failure, not retried).
-- **NEW** `_webhook_execute_with_reference` :440 — calls `POST /webhooks/{id}/{token}` directly with `message_reference` (Fluxer's execute-webhook supports it; fluxer.py's `Webhook.send` doesn't expose it); multipart when files are attached.
-- **NEW** pacing: `min_send_interval` (seconds between sends, 0 = off) enforced by `_pace` :464 before every send, abortable on cancel/deadline (used by `--max-rate`).
-- **NEW** rate-limit handling: `_note_rate_limit` :476 (records `rate_limited_until`, calls `on_rate_limit`), `_rate_limit_remaining` :486, `_cancelled` :489 (uses `stop_check`), `_await_with_ratelimit` :492 (45s timeout enforced only while not rate limited), `_send_with_recovery` :510 (waits out client give-ups with 5/10/20/40/60s backoff, up to 8 rounds, retrying the same message).
-- Roles/assets: `create_role` :580, `create_emoji` :603, `create_sticker` :620, `update_guild_metadata` :637, `remove_community_logo_and_banner` :668.
-- Danger zone: `delete_all_channels` :715, `reset_channel_permissions` :743, `set_channel_permission` :783, `delete_all_roles` :806, `delete_all_emojis_and_stickers` :847.
+- **NEW** `class _RateLimitLogHandler` :47 (`__init__` :50, `emit` :54) — parses the `fluxer.http` logger's `Rate limited on …, retry in Ns` / `Global rate limit hit, pausing for Ns` warnings into `writer._note_rate_limit`.
+- `class FluxerWriter` :63 — `__init__` :50 (now also sets `rate_limited_until`, `on_rate_limit`, `stop_check`), static `fetch_guilds(token, api_url)` :82, `_get_or_create_webhook` :104, `start` :129 (inner `on_ready` :149; attaches the rate-limit log handler), `client` :162, `validate` :166, `close` :934.
+- Channels: `create_channel` :251, `modify_channel` :273, `move_channel` :298, `get_channels` :304.
+- Messages: `send_message` :312 (webhook impersonation: author name/avatar, files, reply, forward, embeds; inner `_build_files` :367 and `_attempt` :379; returns the message ID, `None` only for a permanent 4xx rejection, raises `MessageSendError` otherwise; webhook path passes `fluxer.File` objects, **the bot path (now only used when no webhook can be created) must pass plain `{"filename","data"}` dicts** because `HTTPClient.send_message` indexes them). **Replies** with a webhook available go through `_webhook_execute_with_reference` (native reply, keeps the migrated user's name/avatar); a 4xx on the reference (e.g. target gone) retries once via `Webhook.send` with an "in reply to a message that could not be linked" note, `send_marker` :589 (bot-posted thread start/end markers; still returns `None` on failure, not retried).
+- **NEW** `_webhook_execute_with_reference` :481 — calls `POST /webhooks/{id}/{token}` directly with `message_reference` (Fluxer's execute-webhook supports it; fluxer.py's `Webhook.send` doesn't expose it); multipart when files are attached.
+- **NEW** pacing: `min_send_interval` (seconds between sends, 0 = off) enforced by `_pace` :505 before every send, abortable on cancel/deadline (used by `--max-rate`).
+- **NEW** rate-limit handling: `_note_rate_limit` :517 (records `rate_limited_until`, calls `on_rate_limit`), `_rate_limit_remaining` :527, `_cancelled` :530 (uses `stop_check`), `_await_with_ratelimit` :533 (45s timeout enforced only while not rate limited), `_send_with_recovery` :551 (waits out client give-ups with 5/10/20/40/60s backoff, up to 8 rounds, retrying the same message).
+- Roles/assets: `create_role` :621, `create_emoji` :644, `create_sticker` :661, `update_guild_metadata` :678, `remove_community_logo_and_banner` :709.
+- Danger zone: `delete_all_channels` :756, `reset_channel_permissions` :784, `set_channel_permission` :824, `delete_all_roles` :847, `delete_all_emojis_and_stickers` :888.
 
 ### `fluxer/clone_server.py`
 - `async sync_channel_state(context)` :9 — match existing Fluxer channels to Discord names and record mappings; drops mappings whose target no longer exists (IDs now compared as `str` — the `int`/`str` mismatch used to wipe every mapping each run).
@@ -204,14 +207,16 @@ Discord signs/expires CDN attachment URLs; a bot token can refresh them (`POST /
 
 ### `fluxer/migrate_message.py` — message migration
 - `clean_mentions(...)` :23 — rewrites user/role/channel/emoji mentions for the target (inner `replace_user` :29, `replace_role` :53, `replace_channel` :78, `replace_emoji` :106); supports anonymize mode.
+- **NEW** `_skip_message(context, msg, target_channel_id, reason, attempts, stats, thread_id)` :390 — gives up on a message that keeps failing: posts a bot marker ("There was an error migrating message `id` from **author** … after N attempts, skipping..."), records it in `skipped_messages`, maps the source ID to the marker, advances progress, bumps `stats["skipped"]` / `skipped_ids`.
+- **NEW** `_process_with_retries(context, msg, target_channel_id, stats, **kw)` :429 — wraps `_process_and_send_message`: on `MessageSendError` retries (5s·n backoff, max 60s) until `config.max_message_attempts` (default 5, counted per message in the DB so it survives restarts; 0 = never skip, halt as before) then skips. A cancel / scheduled stop is never counted. Used by both the Waterfall and per-channel loops.
 - **NEW** `format_reply_fallback(ref_text, ref_name, has_attachments, max_len)` :131 — `> quote` + `-# ↳ replying to \`@name\`` header used when the replied-to message can't be linked natively (never migrated / skipped); collapses whitespace, truncates to 160 chars, neutralizes `@everyone`/`@here`.
 - `get_channel_threads(reader, channel_id)` :143 — all (active + archived) threads for a channel.
 - `_process_and_send_message(context, msg, target_channel_id, stats, thread_id, parent_target_id, thread_name, processed_threads)` :176 — per-message core: mentions, attachments, stickers, embeds, replies/forwards, link rewriting, send, record mapping and progress. Only records a mapping / advances progress when Fluxer returns a message ID; lets `MessageSendError` propagate.
 - (in `_process_and_send_message`) **NEW** media links: for a backup source, resolved CDN links in the text are converted to real attachments via `attach_link_media` (max 10 files per message), the mirrored Discord auto-embeds are dropped, and if Fluxer rejects the message with the saved media attached it retries once with the links left as text.
-- `analyze_migration(...)` :390 — count messages/threads/attachments for one channel.
-- `migrate_messages(...)` :468 — per-channel migration incl. threads (inner `_process_missed_threads` :518); **halts on `MessageSendError`** (sets `is_running=False`, returns `stats["error"]`) instead of logging and continuing; **stops cleanly at `context.deadline`** (`stats["stopped"] = "deadline"`, no error); an `error`/`stopped` from a nested thread run is propagated to the parent's stats so the UI reports the real reason.
-- **`analyze_global_migration(...)` :871 — Waterfall pre-scan** (progress lookup keyed by target channel ID; skips messages with nothing to send so totals/ETAs match what is actually sent).
-- **`migrate_global_messages(...)` :933 — Waterfall migration loop**: halts on `MessageSendError` without marking the message; writes `state.set_waterfall_cursor(msg.id)` after each fully handled message; checks `context.deadline_reached()` before each message and treats a `MessageSendError` that coincides with the deadline as a clean stop (message left unmarked, `stats["stopped"] = "deadline"`).
+- `analyze_migration(...)` :464 — count messages/threads/attachments for one channel.
+- `migrate_messages(...)` :542 — per-channel migration incl. threads (inner `_process_missed_threads` :592); **halts on `MessageSendError`** (sets `is_running=False`, returns `stats["error"]`) instead of logging and continuing; **stops cleanly at `context.deadline`** (`stats["stopped"] = "deadline"`, no error); an `error`/`stopped` from a nested thread run is propagated to the parent's stats so the UI reports the real reason.
+- **`analyze_global_migration(...)` :954 — Waterfall pre-scan** (progress lookup keyed by target channel ID; skips messages with nothing to send so totals/ETAs match what is actually sent).
+- **`migrate_global_messages(...)` :1016 — Waterfall migration loop**: halts on `MessageSendError` without marking the message; writes `state.set_waterfall_cursor(msg.id)` after each fully handled message; checks `context.deadline_reached()` before each message and treats a `MessageSendError` that coincides with the deadline as a clean stop (message left unmarked, `stats["stopped"] = "deadline"`).
 
 ---
 
@@ -234,9 +239,9 @@ Same function set as `src/fluxer/`; differences only in the API used.
 - `FirstInfoModal` :27 (`compose`, `on_button_pressed`) — first-launch info (renders `src/first-info.md`).
 - `NewConfigModal` :64 (`compose`, `_get_sanitized_name`, `on_button_pressed`, `on_key`) — name a new profile.
 - `ConfigSelectionScreen` :111 — pick/create profile: `compose` :135, `on_mount` :153, `check_updates` :162, `on_screen_resume` :179, `refresh_configs` :182, `on_list_view_selected` :203, `action_new_config` :219, `on_button_pressed` :235.
-- `ConfigScreen` :283 — tokens, tool mode, target platform: `__init__` :320, `compose` :326, `on_mount` :430, `_fetch_and_populate` :450, `_do_fetch_guilds` :489, `_do_fetch_target_servers` :500, `on_button_pressed` :546, `_get_selected_mode` :566, `_get_selected_platform` :572, `_toggle_target_section` :578, `on_radio_set_changed` :582, `_collect_and_save` :612, `_launch_mode` :652.
-- `ReaperApp` :661 — app root: `on_mount` :686, `action_screenshot` :690, `deliver_screenshot` :694.
-- `run_disco_reaper_tui()` :717 — starts the app.
+- `ConfigScreen` :283 — tokens, tool mode, target platform: `__init__` :322, `compose` :328, `on_mount` :445, `_fetch_and_populate` :465, `_do_fetch_guilds` :504, `_do_fetch_target_servers` :515, `on_button_pressed` :561, `_get_selected_mode` :581, `_get_selected_platform` :587, `_toggle_target_section` :593, `on_radio_set_changed` :597, `_collect_and_save` :627, `_launch_mode` :671.
+- `ReaperApp` :680 — app root: `on_mount` :705, `action_screenshot` :709, `deliver_screenshot` :713.
+- `run_disco_reaper_tui()` :736 — starts the app.
 
 ### `ui/mode_screen.py`
 - `ModeScreen` :21 — one screen for all tool modes; `__init__` :110, `compose` :117, `on_button_pressed` :145, `_toggle_pane` :166 (Backup ↔ Migrate).
@@ -248,13 +253,13 @@ Same function set as `src/fluxer/`; differences only in the API used.
   - Autotest: `run_autotest_sequence` :606, `_run_migration_autotest_logic` :631, `_run_backup_autotest_logic` :680, `_logic_autotest_migrate_all_channels` :1144.
   - Clone/Sync menus: `_open_clone_menu` :722, `_open_sync_menu` :737, `run_batch_clone` :754, `run_batch_sync` :888.
   - Clone/Sync logic: `_logic_clone_channels` :972, `_logic_clone_roles` :1000, `_logic_sync_permissions` :1014, `_logic_copy_assets` :1034, `_logic_sync_metadata` :1053, `_format_sync_report` :1080, `_format_clone_report` :1111.
-  - Matching/preview: `_perform_auto_matching` :2134 (name-match roles/channels/emojis/stickers), `_fetch_dz_preview` :2062, `_fetch_clone_preview` :2131 **and again :2197 (duplicate definition; the later one wins)**.
+  - Matching/preview: `_perform_auto_matching` :2148 (name-match roles/channels/emojis/stickers), `_fetch_dz_preview` :2076, `_fetch_clone_preview` :2145 **and again :2197 (duplicate definition; the later one wins)**.
   - Per-channel migrate: `run_migrate_messages` :1141, `_logic_migrate_messages` :1191 (after the Start/Continue choice and before anything is cleared it asks for **Run Options** — Back returns to the channel picker; then arms the stop time / rate cap, shows live `msgs/min · ~ETA left`, reports a halted run and a **"Paused at the scheduled stop time"** outcome, and resets the options in `finally`).
-  - **NEW run-option helpers (shared by Waterfall and per-channel):** `_ask_run_options` :1626 (pushes `RunOptionsModal`; Fluxer only, other targets get no limits), `_apply_run_options` :1640 (sets `engine.deadline` + `writer.min_send_interval`, logs the options), `_reset_run_options` :1654.
-  - **Waterfall: `_hook_rate_limit_notice` :1659 (NEW — shows "Rate limited … pausing Ns" in the progress log), `run_waterfall_migration` :1668, `_logic_waterfall_migration` :1671** (resume point = waterfall cursor, else per-channel minimum; **for Fluxer, after Start/Continue and before anything is cleared, pushes `RunOptionsModal`** — Back cancels the run — then sets `engine.deadline` and `writer.min_send_interval`, logs the run options, shows live `msgs/min · ~ETA left` in the item status, and resets both in `finally`; reports `result["error"]` when halted and a **"Paused at the scheduled stop time"** outcome (status *Stopped*, audit log entry) when `result["stopped"] == "deadline"`).
-  - Danger Zone: `_open_danger_menu` :1952, `run_batch_danger` :1965, `_logic_dz_delete_channels` :2323, `_logic_dz_reset_perms` :2338, `_logic_dz_delete_roles` :2353, `_logic_dz_delete_assets` :2368.
-  - **NEW** `_resolve_media_links_step(modal)` :2477 — best-effort pass called at the end of `_logic_full_backup`, `run_backup_messages` and `run_backup_sync` (needs the live Discord token; never fails the backup).
-  - Backup: `run_backup_messages` :2387, `_logic_full_backup` :2498, `run_backup_sync` :2617.
+  - **NEW run-option helpers (shared by Waterfall and per-channel):** `_ask_run_options` :1632 (pushes `RunOptionsModal`; Fluxer only, other targets get no limits), `_apply_run_options` :1646 (sets `engine.deadline` + `writer.min_send_interval`, logs the options), `_reset_run_options` :1660.
+  - **Waterfall: `_hook_rate_limit_notice` :1666 (NEW — shows "Rate limited … pausing Ns" in the progress log), `run_waterfall_migration` :1676, `_logic_waterfall_migration` :1679** (resume point = waterfall cursor, else per-channel minimum; **for Fluxer, after Start/Continue and before anything is cleared, pushes `RunOptionsModal`** — Back cancels the run — then sets `engine.deadline` and `writer.min_send_interval`, logs the run options, shows live `msgs/min · ~ETA left` in the item status, and resets both in `finally`; reports `result["error"]` when halted and a **"Paused at the scheduled stop time"** outcome (status *Stopped*, audit log entry) when `result["stopped"] == "deadline"`).
+  - Danger Zone: `_open_danger_menu` :1966, `run_batch_danger` :1979, `_logic_dz_delete_channels` :2337, `_logic_dz_reset_perms` :2352, `_logic_dz_delete_roles` :2367, `_logic_dz_delete_assets` :2382.
+  - **NEW** `_resolve_media_links_step(modal)` :2491 — best-effort pass called at the end of `_logic_full_backup`, `run_backup_messages` and `run_backup_sync` (needs the live Discord token; never fails the backup).
+  - Backup: `run_backup_messages` :2401, `_logic_full_backup` :2512, `run_backup_sync` :2631.
 
 ### `ui/modals.py` — shared dialogs
 - `UILogHandler` :18 — pipes logging into the UI RichLog.
@@ -280,7 +285,7 @@ Same function set as `src/fluxer/`; differences only in the API used.
 - `src/random_users.json` — `names` (and adjectives) for `MigrationDatabase._generate_alias` anonymized aliases.
 
 ## Outside `src/` (for reference)
-- `tests/` — `conftest.py`, `test_database.py`, `test_migration.py`, `test_ui.py`, `test_utils.py`, **`test_fluxer_rate_limit.py`** (NEW — retry-after-client-gives-up, give-up raises `MessageSendError`, permanent rejection propagates, cancel stops waiting, rate-limit log parsing, webhook-token redaction), **`test_media_links.py`** (NEW — link extraction/normalization, same bytes under different URLs stored once, dead/too-large/error handling and skipping on re-run, dry run, refresh 429 + bad token, signed-URL-404 = dead, attach_link_media limits, embed mirroring), **`test_timed_waterfall.py`** (NEW — `--until`/`--for` and stop-spec parsing, the TUI `RunOptionsModal` (blank = no limits, validation, Enter submits, Back → `None`), deadline stops the loop cleanly between messages, send error at the deadline is a clean stop and leaves the message unmarked, an error before the deadline is still an error, `--max-rate` pacing and its cancel). Run with `./runtests.sh` (uses `./venv`). Known: 4 pre-existing failures in `test_database.py`.
+- `tests/` — `conftest.py`, `test_database.py`, `test_migration.py`, `test_ui.py`, `test_utils.py`, **`test_fluxer_rate_limit.py`** (NEW — retry-after-client-gives-up, give-up raises `MessageSendError`, permanent rejection propagates, cancel stops waiting, rate-limit log parsing, webhook-token redaction), **`test_skip_messages.py`** (NEW — timeout scaling, a timed-out send that actually landed is not retried, retry-then-skip with marker/progress/persistence, skip still advances if the marker can't be posted, 0 disables skipping, cancel is never counted, the waterfall continues past a skipped message, DB records), **`test_media_links.py`** (NEW — link extraction/normalization, same bytes under different URLs stored once, dead/too-large/error handling and skipping on re-run, dry run, refresh 429 + bad token, signed-URL-404 = dead, attach_link_media limits, embed mirroring), **`test_timed_waterfall.py`** (NEW — `--until`/`--for` and stop-spec parsing, the TUI `RunOptionsModal` (blank = no limits, validation, Enter submits, Back → `None`), deadline stops the loop cleanly between messages, send error at the deadline is a clean stop and leaves the message unmarked, an error before the deadline is still an error, `--max-rate` pacing and its cancel). Run with `./runtests.sh` (uses `./venv`). Known: 4 pre-existing failures in `test_database.py`.
 - **`scripts/live_waterfall.py`** (NEW) — headless live-test harness, configured by `livetest.toml` (gitignored; `[discord]`, `[fluxer]`, `[run]`):
   - `load` :22, `make_ctx(cfg, mode)` :27 — builds a `MigrationContext` (`"live"` or `"backup"` source).
   - `cmd_backup` :41 — real Discord → local backup via `DiscordExporter` (same calls as the TUI's full backup).
@@ -289,6 +294,7 @@ Same function set as `src/fluxer/`; differences only in the API used.
   - `cmd_verify` :172 — compares the backup with what is on Fluxer: ghosts (marked sent, absent), not-migrated, extras, out-of-order.
   - Typical sequence: `backup` → `run --fresh --stop-after 60` → `run --resume` → `verify`.
 - **`scripts/timed_waterfall.py`** (NEW) — timed / overnight headless Waterfall for real profiles (see [docs/overnight.md](docs/overnight.md)); the time parsing now lives in `core/utils.py`: `profile_paths` :35, `log` :41, `run(args)` :45 (validate → clone/sync → resume from cursor → count remaining → `migrate_global_messages` with `ctx.deadline`; SIGINT/SIGTERM stop cleanly; prints rate, ETA and a summary), `main` :144. Options `--profile`, `--until`/`--for`, `--max-rate`, `--fresh`, `--no-clone`, `--no-count`, `--report-every`. Exit codes: `0` done, `10` paused with work left, `1` error, `2` usage/config.
+- **`scripts/list_skipped.py`** (NEW) — lists messages skipped after repeated send errors from the migration DB's `skipped_messages` table (`--profile`, `--state-db`).
 - **`scripts/monitor_run.py`** (NEW) — read-only observer for a running TUI/CLI session; see [docs/overnight.md](docs/overnight.md#measuring-a-full-run-scriptsmonitor_runpy). `parse_log_line` (Fluxer 429 / global / 5xx / connection / give-up / halt lines), `LogTail` (follows `.reaper.log`, survives truncation and rotation), `sample_db` (read-only counts from `backup.db` and the migration DB), `probe` (Fluxer API reachability from this IP), `find_process` / `rss_mb`, `Stats.summary`, `main`. Writes a CSV plus `<out>.summary.txt`.
 - **`scripts/resolve_media_links.py`** (NEW) — updates an existing backup: finds CDN links in message text, refreshes + downloads each once, dedupes by SHA-256 into the media pool, records results in `link_media`. `--profile`, `--dry-run`, `--retry-dead`, `--concurrency`, `--max-size-mb`, `--limit`, `--backup-dir`. Safe to re-run.
 - `livetest-work/` (gitignored) — generated backup + migration-state DB; `livetest.log` — harness log.

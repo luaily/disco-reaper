@@ -127,6 +127,7 @@ async def test_send_error_at_deadline_is_a_clean_stop_and_unmarked(monkeypatch):
 @pytest.mark.asyncio
 async def test_send_error_before_deadline_is_still_an_error(monkeypatch):
     ctx = _ctx([1, 2], deadline=time.time() + 3600)
+    ctx.config = types.SimpleNamespace(max_message_attempts=0)       # 0 = never skip: halt at the failing message
 
     async def fake_send(context, msg, **kw):
         raise MessageSendError("gave up")

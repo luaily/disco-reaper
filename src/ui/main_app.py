@@ -313,6 +313,8 @@ class ConfigScreen(Screen):
     #inp_discord_server { margin-bottom: 1; }
     .switch_row { height: auto; align: left middle; margin-top: 1; margin-bottom: 1; }
     #lbl_anonymize { margin-right: 2; margin-top: 0; }
+    #lbl_attempts { margin-right: 2; margin-top: 1; }
+    #inp_max_attempts { width: 8; }
     """
 
     BINDINGS = [("escape", "go_back", "Back")]
@@ -417,6 +419,19 @@ class ConfigScreen(Screen):
                             Label("Anonymize Users:", id="lbl_anonymize"),
                             Switch(value=self.config.anonymize_users, id="inp_anonymize_users", tooltip="Anonymize user Names and Avatars during migration"),
                             id="anonymize_row",
+                            classes="switch_row"
+                        )
+
+                        yield Horizontal(
+                            Label("Max send attempts per message:", id="lbl_attempts"),
+                            Input(
+                                value=str(self.config.max_message_attempts),
+                                id="inp_max_attempts",
+                                type="integer",
+                                max_length=3,
+                                tooltip="A message that keeps failing to send is retried this many times,\nthen skipped with a marker in the channel. 0 = never skip (stop instead)"
+                            ),
+                            id="attempts_row",
                             classes="switch_row"
                         )
 
@@ -644,6 +659,10 @@ class ConfigScreen(Screen):
                 self.config.stoat_api_url = api_val
             
             self.config.anonymize_users = self.query_one("#inp_anonymize_users", Switch).value
+            try:
+                self.config.max_message_attempts = max(0, int(self.query_one("#inp_max_attempts", Input).value.strip()))
+            except ValueError:
+                self.config.max_message_attempts = 5
         else:
             self.config.target_platform = "none"
 

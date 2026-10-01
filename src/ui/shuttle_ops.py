@@ -1606,8 +1606,14 @@ class OperationPane(Container):
                 event_title = "Message Migration"
                 modal.phase_report(event_title, "stopped", show_back=False)
 
+            if result.get("skipped"):
+                ids = ", ".join(result.get("skipped_ids", [])[:10]) + (" ..." if len(result.get("skipped_ids", [])) > 10 else "")
+                modal.write(f"[bold yellow]{result['skipped']} message(s) were skipped after repeated send errors "
+                            f"(a marker was posted in the channel): {ids}[/bold yellow]")
             lines = [f"Migrated Discord #{source_channel.name} → {platform_name} #{target_channel.get('name')}:"]
             lines.append(f"{result['messages']} messages, {result['attachments']} attachments, {result['threads']} threads")
+            if result.get("skipped"):
+                lines.append(f"{result['skipped']} skipped after repeated errors: {', '.join(result.get('skipped_ids', [])[:10])}")
             await log_audit_event(self.engine, event_title, "\n".join(lines))
 
         except Exception as e:
@@ -1653,11 +1659,13 @@ class OperationPane(Container):
 
     def _reset_run_options(self) -> None:
         self.engine.deadline = None
+        self.engine.on_notice = None
         if hasattr(self.engine.writer, "min_send_interval"):
             self.engine.writer.min_send_interval = 0.0
 
     def _hook_rate_limit_notice(self, modal) -> None:
         """Shows writer rate-limit pauses in the progress log (Fluxer writer only)."""
+        self.engine.on_notice = lambda text: modal.write(text)     # retries / skipped messages
         writer = getattr(self.engine, "writer", None)
         if writer is not None and hasattr(writer, "on_rate_limit"):
             writer.on_rate_limit = lambda secs: modal.write(
@@ -1932,8 +1940,14 @@ class OperationPane(Container):
                 modal.write(f"[bold yellow]Interrupted! {result['messages']} messages migrated.[/bold yellow]")
                 modal.phase_report("Waterfall Migration", "stopped", show_back=False)
                 
+            if result.get("skipped"):
+                ids = ", ".join(result.get("skipped_ids", [])[:10]) + (" ..." if len(result.get("skipped_ids", [])) > 10 else "")
+                modal.write(f"[bold yellow]{result['skipped']} message(s) were skipped after repeated send errors "
+                            f"(a marker was posted in each channel): {ids}[/bold yellow]")
             lines = [f"{'Paused (scheduled stop time) while migrating' if result.get('stopped') == 'deadline' else 'Migrated'} Server Globally → {platform_name}:"]
             lines.append(f"{result['messages']} messages, {result['attachments']} attachments, {result['threads']} threads")
+            if result.get("skipped"):
+                lines.append(f"{result['skipped']} skipped after repeated errors: {', '.join(result.get('skipped_ids', [])[:10])}")
             await log_audit_event(self.engine, "Waterfall Migration", "\n".join(lines))
 
         except Exception as e:

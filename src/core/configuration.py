@@ -15,6 +15,7 @@ class AppConfig(BaseModel):
     stoat_server_id: Optional[str] = Field(default=None)
     stoat_api_url: Optional[str] = Field(default=None)
     anonymize_users: bool = Field(default=False)
+    max_message_attempts: int = Field(default=5)   # tries per message before it is skipped with a marker (0 = never skip: halt instead)
     log_level: str = Field(default="INFO")
 
 def load_config(config_path: Union[str, Path] = "reaper_config.yaml", create_if_missing: bool = True) -> AppConfig:

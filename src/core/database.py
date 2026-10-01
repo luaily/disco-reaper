@@ -148,6 +148,26 @@ class MigrationDatabase:
             )
         """)
         
+        # Failed-send attempts per source message (survives restarts) and messages we gave up on
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS message_attempts (
+                source_id TEXT PRIMARY KEY,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                updated_at TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS skipped_messages (
+                source_id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                author TEXT,
+                reason TEXT,
+                attempts INTEGER,
+                skipped_at TEXT
+            )
+        """)
+
         # Table for per-thread stats
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS thread_tracking (
@@ -567,8 +587,45 @@ class MigrationDatabase:
         conn.execute("DELETE FROM thread_mappings")
         conn.execute("DELETE FROM channel_tracking")
         conn.execute("DELETE FROM thread_tracking")
+        conn.execute("DELETE FROM message_attempts")
+        conn.execute("DELETE FROM skipped_messages")
         conn.commit()
         logger.info("Cleared ALL tracking and message mapping data globally.")
+
+    # ── failed-send attempts / skipped messages ────────────────────────────
+    def get_message_attempts(self, source_id) -> int:
+        row = self._get_conn().execute("SELECT attempts FROM message_attempts WHERE source_id = ?", (str(source_id),)).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def record_message_attempt(self, source_id, error: str = "") -> int:
+        """Counts one more failed send for this message; returns the new total."""
+        from datetime import datetime, timezone
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO message_attempts (source_id, attempts, last_error, updated_at) VALUES (?, 1, ?, ?)
+            ON CONFLICT(source_id) DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error,
+                                                 updated_at = excluded.updated_at
+        """, (str(source_id), (error or "")[:300], datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        return self.get_message_attempts(source_id)
+
+    def clear_message_attempts(self, source_id):
+        conn = self._get_conn()
+        conn.execute("DELETE FROM message_attempts WHERE source_id = ?", (str(source_id),))
+        conn.commit()
+
+    def record_skipped_message(self, source_id, channel_id, author: str, reason: str, attempts: int):
+        from datetime import datetime, timezone
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO skipped_messages (source_id, channel_id, author, reason, attempts, skipped_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (str(source_id), str(channel_id), author, (reason or "")[:300], attempts, datetime.now(timezone.utc).isoformat()))
+        conn.execute("DELETE FROM message_attempts WHERE source_id = ?", (str(source_id),))
+        conn.commit()
+
+    def get_skipped_messages(self) -> list:
+        return [dict(r) for r in self._get_conn().execute("SELECT * FROM skipped_messages ORDER BY source_id").fetchall()]
 
     def close(self):
         if hasattr(self._local, "conn"):

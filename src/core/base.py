@@ -62,6 +62,8 @@ class MigrationContext:
         # Optional wall-clock stop time (epoch seconds) for timed / overnight runs. Checked between messages,
         # and by the writer so a rate-limit wait never runs past it.
         self.deadline: float | None = None
+        # Optional UI hook for human-readable run notices (retries, skipped messages): callable(str)
+        self.on_notice = None
         # Lets the writer abort rate-limit waits when the user cancels or the deadline passes
         self.writer.stop_check = lambda: (not self.is_running) or self.deadline_reached()
 

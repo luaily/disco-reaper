@@ -24,10 +24,24 @@ def _redact(text) -> str:
     return _WEBHOOK_URL_RE.sub(r"\1***", str(text))
 
 
+_ASSUMED_UPLOAD_BPS = 100_000      # assume at least ~100 KB/s up so big attachments aren't timed out too early
+_DELIVERY_LOOKBACK_S = 180         # how far back to look for a message whose send "timed out"
+
+
+def _upload_timeout(files) -> float:
+    """Send timeout that grows with the payload (a flat 45s can never succeed for a large attachment)."""
+    total = sum(len(f["data"]) for f in files) if files else 0
+    return min(900.0, _SEND_TIMEOUT + total / _ASSUMED_UPLOAD_BPS)
+
+
 class MessageSendError(Exception):
     """A message could NOT be delivered for a transient reason (rate limit that never cleared,
     timeout, outage, cancellation). The caller must stop and must NOT record the message as
     migrated, so a resume retries it instead of skipping it."""
+
+
+class SendTimeout(MessageSendError):
+    """The send timed out with no rate limit active: the message may or may not have been delivered."""
 
 
 class _RateLimitLogHandler(logging.Handler):
@@ -413,9 +427,22 @@ class FluxerWriter:
             return str(msg_data["id"]) if msg_data else None
 
         await self._pace()
+        send_timeout = _upload_timeout(files)
+        started = time.time()
         try:
             try:
-                return await self._send_with_recovery(_attempt, channel_id)
+                return await self._send_with_recovery(_attempt, channel_id, send_timeout)
+            except SendTimeout:
+                # The request may have gone through even though we never saw the answer. Look for it before
+                # anyone retries, otherwise a retry would post a duplicate.
+                if webhook:
+                    found = await self._find_delivered(
+                        channel_id, started, f"{author_name} (discord)",
+                        {final_content, "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content})
+                    if found:
+                        logger.warning(f"Fluxer: send to {channel_id} timed out but the message was delivered ({found}); not retrying")
+                        return found
+                raise
             except MessageSendError:
                 raise
             except Exception as e:
@@ -424,7 +451,7 @@ class FluxerWriter:
                     logger.warning(f"Fluxer: reply reference rejected ({status}) for channel {channel_id}; "
                                    f"retrying without the reply link")
                     use_reference = False
-                    return await self._send_with_recovery(_attempt, channel_id)
+                    return await self._send_with_recovery(_attempt, channel_id, send_timeout)
                 raise
         except MessageSendError:
             raise
@@ -436,6 +463,20 @@ class FluxerWriter:
                 err_msg += f" - Details: {e.errors}"
             logger.error(err_msg)
             return None
+
+    async def _find_delivered(self, channel_id: str, since_ts: float, username: str, bodies: set) -> Optional[str]:
+        """After a timed-out send: the ID of a recent message in the channel that is exactly what we tried to
+        send (same webhook name and body), or None. Snowflakes embed their creation time, so `after` bounds it."""
+        try:
+            since = (int((since_ts - _DELIVERY_LOOKBACK_S) * 1000) - 1420070400000) << 22
+            recent = await self.client.get_messages(channel_id, limit=50, after=str(max(since, 0)))
+        except Exception as e:
+            logger.debug(f"Fluxer: delivery check failed: {_redact(e)}")
+            return None
+        for m in recent or []:
+            if (m.get("author") or {}).get("username") == username and m.get("content") in bodies:
+                return str(m["id"])
+        return None
 
     async def _webhook_execute_with_reference(self, webhook, *, content, username, avatar_url, files, embeds,
                                               message_reference) -> Optional[str]:
@@ -489,25 +530,25 @@ class FluxerWriter:
     def _cancelled(self) -> bool:
         return bool(self.stop_check and self.stop_check())
 
-    async def _await_with_ratelimit(self, coro) -> Any:
+    async def _await_with_ratelimit(self, coro, timeout: float = _SEND_TIMEOUT) -> Any:
         """Awaits a send, but only enforces the timeout while we are NOT waiting on a rate limit.
         (A plain wait_for would cancel a request that is merely sleeping through a 429 pause.)"""
         task = asyncio.ensure_future(coro)
         try:
             while True:
-                done, _ = await asyncio.wait({task}, timeout=_SEND_TIMEOUT)
+                done, _ = await asyncio.wait({task}, timeout=timeout)
                 if done:
                     return task.result()
                 if self._cancelled():
                     raise MessageSendError("Cancelled while sending")
                 if self._rate_limit_remaining() > 0:
                     continue  # paused by the rate limiter, keep waiting
-                raise MessageSendError(f"Send timed out after {_SEND_TIMEOUT:.0f}s (delivery unknown)")
+                raise SendTimeout(f"Send timed out after {timeout:.0f}s (delivery unknown)")
         finally:
             if not task.done():
                 task.cancel()
 
-    async def _send_with_recovery(self, attempt_fn, channel_id: str) -> str:
+    async def _send_with_recovery(self, attempt_fn, channel_id: str, timeout: float = _SEND_TIMEOUT) -> str:
         """Runs a send. Rate limits/outages the HTTP client can't ride out are waited out here and the
         SAME message is retried. Returns the new message id, or raises MessageSendError.
         Permanent API rejections propagate as their original exception."""
@@ -515,7 +556,7 @@ class FluxerWriter:
             if self._cancelled():
                 raise MessageSendError("Cancelled")
             try:
-                msg_id = await self._await_with_ratelimit(attempt_fn())
+                msg_id = await self._await_with_ratelimit(attempt_fn(), timeout)
                 if msg_id:
                     return msg_id
                 raise MessageSendError(f"Fluxer returned no message id for channel {channel_id}")

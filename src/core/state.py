@@ -245,6 +245,24 @@ class MigrationState:
             self.db.clear_all_migration_data()
             self.db.set_metadata("waterfall_cursor", "")
 
+    # --- Failed sends / skipped messages ---
+    def get_message_attempts(self, source_id) -> int:
+        return self.db.get_message_attempts(source_id) if self._ensure_db() else 0
+
+    def record_message_attempt(self, source_id, error: str = "") -> int:
+        return self.db.record_message_attempt(source_id, error) if self._ensure_db() else 1
+
+    def clear_message_attempts(self, source_id):
+        if self._ensure_db():
+            self.db.clear_message_attempts(source_id)
+
+    def record_skipped_message(self, source_id, channel_id, author: str, reason: str, attempts: int):
+        if self._ensure_db():
+            self.db.record_skipped_message(source_id, channel_id, author, reason, attempts)
+
+    def get_skipped_messages(self) -> list:
+        return self.db.get_skipped_messages() if self._ensure_db() else []
+
     def get_waterfall_cursor(self) -> int | None:
         """Source message ID of the last message the Waterfall run fully handled (sent, or
         deliberately skipped). Every message with a lower ID is done. None if never set."""

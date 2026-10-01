@@ -61,7 +61,10 @@ async def run(args) -> int:
     elif args.duration:
         deadline = time.time() + parse_duration(args.duration)
 
+    if args.max_attempts is not None:
+        config.max_message_attempts = max(0, args.max_attempts)
     ctx = MigrationContext(config, "fluxer", "backup", base_dir)
+    ctx.on_notice = lambda text: log(re.sub(r"\[/?[a-z ]+\]", "", text))
     ctx.deadline = deadline
     if args.max_rate:
         ctx.writer.min_send_interval = 60.0 / args.max_rate
@@ -120,6 +123,9 @@ async def run(args) -> int:
         res = await mm.migrate_global_messages(ctx, after_message_id=after_id, progress_callback=progress)
 
         sent = res["messages"]
+        if res.get("skipped"):
+            log(f"{res['skipped']} message(s) were SKIPPED after repeated errors (marker posted in the channel): "
+                f"{', '.join(res.get('skipped_ids', [])[:20])}. Full list: scripts/list_skipped.py --profile {args.profile}")
         rate = sent / max(1e-6, time.time() - t0)
         cursor = ctx.state.get_waterfall_cursor()
         if res.get("error"):
@@ -148,6 +154,8 @@ def main():
     g.add_argument("--until", help="stop at HH:MM local time (next occurrence)")
     g.add_argument("--for", dest="duration", help="stop after this long, e.g. 9h, 90m, 9h30m, 45s")
     ap.add_argument("--max-rate", type=float, default=0, help="cap at N messages/minute (0 = as fast as Fluxer allows)")
+    ap.add_argument("--max-attempts", type=int, default=None,
+                    help="send attempts per message before it is skipped with a marker (default: profile setting, 5; 0 = never skip)")
     ap.add_argument("--fresh", action="store_true", help="clear migration state first (re-sends everything!)")
     ap.add_argument("--no-clone", action="store_true", help="skip the channel clone/sync step")
     ap.add_argument("--no-count", action="store_true", help="skip the up-front remaining-message count (faster start)")

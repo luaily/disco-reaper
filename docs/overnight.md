@@ -113,3 +113,16 @@ It samples every `--interval` seconds and never touches the app:
 Ctrl-C (or the app exiting) prints a summary and writes `<out>.summary.txt`; the per-sample CSV is written as it goes.
 
 To find a rate that avoids 429s entirely, run the migration with a *Max speed* in the Run Options dialog (e.g. 45, then 55, then 65 msgs/min) and compare "429s per migrated message" — the highest cap that stays near zero is your safe ceiling. Fewer 429s means less hammering of the API.
+
+## Messages that keep failing
+A send that fails (timeout, outage, rate limit that never clears) is retried, and after **5 attempts** the message is
+skipped: the bot posts a marker in the channel ("There was an error migrating message `id` … skipping...") and the run
+carries on, so one bad message can't stall an overnight run. Change the limit on the Configuration screen ("Max send
+attempts per message"), in `reaper_config.yaml` (`max_message_attempts`) or with `--max-attempts N`; `0` = never skip,
+stop at the first failure. List what was skipped with:
+
+```bash
+./venv/bin/python scripts/list_skipped.py --profile MyServer
+```
+Upload timeouts grow with the file size, and a send that timed out is looked for in the channel before it is retried,
+so large attachments no longer fail on a fixed 45s limit and a retry won't post a duplicate.

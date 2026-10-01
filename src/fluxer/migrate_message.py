@@ -387,6 +387,80 @@ async def _process_and_send_message(
         
     return fluxer_msg_id
 
+async def _skip_message(context: MigrationContext, msg: Any, target_channel_id: str, reason: str, attempts: int,
+                        stats: Dict[str, Any], thread_id: str | None = None) -> str | None:
+    """Gives up on a message that keeps failing: posts a visible marker, records the skip, advances progress."""
+    anonymize = context.config.anonymize_users if hasattr(context, "config") else False
+    try:
+        author = (context.state.get_user_alias(str(msg.author.id)) if anonymize else msg.author.display_name) or "unknown"
+    except Exception:
+        author = "unknown"
+    when = int(msg.created_at.timestamp())
+    marker_id = None
+    try:
+        marker_id = await context.fluxer_writer.send_marker(
+            channel_id=target_channel_id,
+            content=f"⚠️ There was an error migrating message `{msg.id}` from **{author}** (<t:{when}:f>) "
+                    f"after {attempts} attempts, skipping...")
+    except Exception as e:
+        logger.warning(f"Could not post the skip marker for message {msg.id}: {e}")
+    context.state.record_skipped_message(msg.id, getattr(msg.channel, "id", ""), author, reason, attempts)
+    # The message is handled (skipped): advance progress so a resume doesn't retry it, and map it to the marker
+    # so replies / links to it still resolve to something.
+    if thread_id:
+        if marker_id:
+            context.state.set_thread_message_mapping(target_channel_id, thread_id, str(msg.id), marker_id)
+        context.state.update_thread_last_message_timestamp(target_channel_id, thread_id, str(msg.created_at))
+        context.state.update_thread_last_message_id(target_channel_id, thread_id, str(msg.id))
+    else:
+        if marker_id:
+            context.state.set_message_mapping(target_channel_id, str(msg.id), marker_id)
+        context.state.update_last_message_timestamp(target_channel_id, str(msg.created_at))
+        context.state.update_last_message_id(target_channel_id, str(msg.id))
+    stats["skipped"] = stats.get("skipped", 0) + 1
+    stats.setdefault("skipped_ids", []).append(str(msg.id))
+    logger.error(f"Skipped message {msg.id} after {attempts} failed attempts: {reason}")
+    notice = getattr(context, "on_notice", None)
+    if notice:
+        notice(f"[bold yellow]Skipped message {msg.id} after {attempts} failed attempts: {reason}[/bold yellow]")
+    return marker_id
+
+
+async def _process_with_retries(context: MigrationContext, msg: Any, target_channel_id: str, stats: Dict[str, Any],
+                                **kwargs) -> str | None:
+    """_process_and_send_message, but a message that keeps failing to send is retried and finally skipped.
+
+    Failed tries are counted per message in the migration DB (so they survive restarts) against
+    config.max_message_attempts (default 5; 0 = never skip, halt as before). A cancel or the scheduled stop time is
+    not the message's fault and is never counted."""
+    max_attempts = int(getattr(getattr(context, "config", None), "max_message_attempts", 5) or 0)
+    notice = getattr(context, "on_notice", None)
+    failed_here = False
+    while True:
+        try:
+            result = await _process_and_send_message(context=context, msg=msg, target_channel_id=target_channel_id,
+                                                     stats=stats, **kwargs)
+            if failed_here:
+                context.state.clear_message_attempts(msg.id)
+            return result
+        except MessageSendError as e:
+            if max_attempts <= 0 or not context.is_running or context.deadline_reached():
+                raise
+            failed_here = True
+            attempts = context.state.record_message_attempt(msg.id, str(e))
+            if attempts >= max_attempts:
+                return await _skip_message(context, msg, target_channel_id, str(e), attempts, stats,
+                                           kwargs.get("thread_id"))
+            delay = min(60, 5 * attempts)
+            logger.warning(f"Message {msg.id} failed ({e}); attempt {attempts}/{max_attempts}, retrying in {delay}s")
+            if notice:
+                notice(f"[yellow]Message {msg.id} failed ({e}). Attempt {attempts}/{max_attempts}; retrying in {delay}s...[/yellow]")
+            for _ in range(delay):
+                if not context.is_running or context.deadline_reached():
+                    break
+                await asyncio.sleep(1)
+
+
 async def analyze_migration(context: MigrationContext, source_channel_id: int, after_message_id: int | None = None, inclusive: bool = False, progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None, processed_threads: set | None = None) -> Dict[str, int]:
 
     """
@@ -557,6 +631,9 @@ async def migrate_messages(
                 for _k in ("error", "stopped"):
                     if thread_stats.get(_k):
                         stats.setdefault(_k, thread_stats[_k])
+                if thread_stats.get("skipped"):
+                    stats["skipped"] = stats.get("skipped", 0) + thread_stats["skipped"]
+                    stats.setdefault("skipped_ids", []).extend(thread_stats.get("skipped_ids", []))
                 
                 if context.is_running:
                     await context.fluxer_writer.send_marker(
@@ -625,6 +702,9 @@ async def migrate_messages(
                         for _k in ("error", "stopped"):
                             if thread_stats.get(_k):
                                 stats.setdefault(_k, thread_stats[_k])
+                        if thread_stats.get("skipped"):
+                            stats["skipped"] = stats.get("skipped", 0) + thread_stats["skipped"]
+                            stats.setdefault("skipped_ids", []).extend(thread_stats.get("skipped_ids", []))
     
                         # Send End Marker
                         if context.is_running:
@@ -790,7 +870,7 @@ async def migrate_messages(
                 continue
                 
             try:
-                fluxer_msg_id = await _process_and_send_message(
+                fluxer_msg_id = await _process_with_retries(
                     context=context,
                     msg=msg,
                     target_channel_id=target_channel_id,
@@ -826,6 +906,9 @@ async def migrate_messages(
                         for _k in ("error", "stopped"):
                             if thread_stats.get(_k):
                                 stats.setdefault(_k, thread_stats[_k])
+                        if thread_stats.get("skipped"):
+                            stats["skipped"] = stats.get("skipped", 0) + thread_stats["skipped"]
+                            stats.setdefault("skipped_ids", []).extend(thread_stats.get("skipped_ids", []))
                         
                         if context.is_running:
                             await context.fluxer_writer.send_marker(
@@ -998,7 +1081,7 @@ async def migrate_global_messages(
                 stats["threads"] += 1
 
             try:
-                await _process_and_send_message(
+                await _process_with_retries(
                     context=context,
                     msg=msg,
                     target_channel_id=target_channel_id,
