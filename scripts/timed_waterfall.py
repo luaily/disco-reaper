@@ -63,6 +63,10 @@ async def run(args) -> int:
 
     if args.max_attempts is not None:
         config.max_message_attempts = max(0, args.max_attempts)
+    if args.max_outage is not None:
+        config.max_outage_minutes = max(0, args.max_outage)
+    if args.notify_user:
+        config.notify_user_id = args.notify_user.strip()
     ctx = MigrationContext(config, "fluxer", "backup", base_dir)
     ctx.on_notice = lambda text: log(re.sub(r"\[/?[a-z ]+\]", "", text))
     ctx.deadline = deadline
@@ -82,6 +86,7 @@ async def run(args) -> int:
     log(f"Timed Waterfall: profile={args.profile} stop={stop_txt} max_rate={args.max_rate or 'unlimited'}/min")
     code = EXIT_ERROR
     await ctx.start_connections()
+    ctx.notify(f"Timed Waterfall started (profile `{args.profile}`, stop {stop_txt}).", kind="info")
     try:
         v = await ctx.writer.validate()
         if not (v.get("token") and v.get("community")):
@@ -100,18 +105,35 @@ async def run(args) -> int:
             log("No channels are mapped to Fluxer; refusing to run (every message would be skipped).")
             return EXIT_ERROR
 
-        after_id = ctx.state.get_waterfall_cursor()
-        log(f"Resuming after source message ID {after_id}" if after_id else "Starting from the beginning.")
+        verify: dict = {}
+        if args.from_message:
+            try:
+                start_msg = await mm.find_start_message(ctx, args.from_message)
+            except ValueError as e:
+                log(str(e))
+                return EXIT_USAGE
+            after_id = int(args.from_message) - 1
+            verify = {"verify_server": True, "start_ts": start_msg.created_at.timestamp()}
+            log(f"Starting at message {args.from_message}: every message from there on is checked against the Fluxer "
+                f"server and only the ones that are missing get sent (the database's progress is ignored).")
+        else:
+            after_id = ctx.state.get_waterfall_cursor()
+            log(f"Resuming after source message ID {after_id}" if after_id else "Starting from the beginning.")
 
         total = None
         if not args.no_count:
             log("Counting remaining messages...")
-            total = (await mm.analyze_global_migration(ctx, after_message_id=after_id))["messages"]
+            total = (await mm.analyze_global_migration(ctx, after_message_id=after_id, ignore_progress=bool(verify)))["messages"]
             log(f"{total} messages remaining.")
 
         t0 = time.time()
+        from src.core.notify import ProgressReporter
+        reporter = ProgressReporter(
+            ctx.notify, total, lambda: (60.0 / ctx.writer.min_send_interval) if ctx.writer.min_send_interval else 0.0,
+            title="Timed Waterfall", interval_minutes=args.report_interval)
 
         async def progress(st):
+            reporter.update(st)
             n = st["messages"]
             if n and n % args.report_every == 0:
                 rate = n / max(1e-6, time.time() - t0)
@@ -120,9 +142,18 @@ async def run(args) -> int:
                     f"cursor={ctx.state.get_waterfall_cursor()}")
 
         ctx.writer.on_rate_limit = lambda secs: log(f"rate limited: pausing {secs:.1f}s")
-        res = await mm.migrate_global_messages(ctx, after_message_id=after_id, progress_callback=progress)
+        reporter.start()
+        try:
+            res = await mm.migrate_global_messages(ctx, after_message_id=after_id, progress_callback=progress, **verify)
+        finally:
+            await reporter.stop()
+        if res.get("already_on_server"):
+            log(f"{res['already_on_server']} message(s) were already on the server and were not sent again.")
 
         sent = res["messages"]
+        kind, text = __import__("src.core.notify", fromlist=["describe_result"]).describe_result(
+            "Timed Waterfall", res, time.time() - started)
+        ctx.notify(text, kind=kind, with_logs=(kind == "error"))
         if res.get("skipped"):
             log(f"{res['skipped']} message(s) were SKIPPED after repeated errors (marker posted in the channel): "
                 f"{', '.join(res.get('skipped_ids', [])[:20])}. Full list: scripts/list_skipped.py --profile {args.profile}")
@@ -156,11 +187,25 @@ def main():
     ap.add_argument("--max-rate", type=float, default=0, help="cap at N messages/minute (0 = as fast as Fluxer allows)")
     ap.add_argument("--max-attempts", type=int, default=None,
                     help="send attempts per message before it is skipped with a marker (default: profile setting, 5; 0 = never skip)")
+    ap.add_argument("--max-outage", type=int, default=None,
+                    help="stop (exit 1, nothing skipped) if Fluxer stays unavailable this many minutes "
+                         "(default: profile setting, 0 = wait as long as it takes)")
+    ap.add_argument("--notify-user", default=None,
+                    help="Fluxer user ID the migration bot DMs about problems and the final summary "
+                         "(default: notify_user_id in the profile)")
+    ap.add_argument("--from-message", type=int, default=None, metavar="ID",
+                    help="start at this source message ID (inclusive) and check every message from there on against the "
+                         "Fluxer server, sending only the ones that are missing; use it to repair skipped messages")
+    ap.add_argument("--report-interval", type=int, default=60, metavar="MIN",
+                    help="minutes between progress DMs, on the wall clock (60 = the top of every hour); needs a "
+                         "notify user. The first report is sent at the start.")
     ap.add_argument("--fresh", action="store_true", help="clear migration state first (re-sends everything!)")
     ap.add_argument("--no-clone", action="store_true", help="skip the channel clone/sync step")
     ap.add_argument("--no-count", action="store_true", help="skip the up-front remaining-message count (faster start)")
     ap.add_argument("--report-every", type=int, default=100, help="progress line every N messages")
     args = ap.parse_args()
+    if args.from_message and args.fresh:
+        ap.error("--from-message and --fresh can't be combined (--fresh wipes the progress it relies on)")
     try:
         if args.until:
             parse_until(args.until)

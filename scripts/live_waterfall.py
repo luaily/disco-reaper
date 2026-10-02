@@ -81,31 +81,33 @@ INJECT_PLAN = {
     "global":    [(8, 8, 3.0, True)],     # one GLOBAL 429 (3s)
     "sustained": [(12, 17, 0.5, False)],  # 6 in a row: outlasts the library's 4 retries -> RuntimeError -> our pause+retry
     "halt":      [(20, 10**9, 0.3, False)],  # never clears: our recovery must give up, halt, and NOT mark the message
+    # (lo, hi, retry_after, global, HTTP status): a long 503 outage on the send route. Enough failing attempts that the
+    # old code would have used up its 5 attempts and SKIPPED messages; now the run must hold and resume.
+    "outage":    [(20, 75, 0, False, 503)],
 }
 
 
 def install_injection(names):
     import aiohttp
-    windows = [w for n in names for w in INJECT_PLAN[n]]
+    windows = [tuple(w) + (429,) if len(w) == 4 else tuple(w) for n in names for w in INJECT_PLAN[n]]
     calls = {"n": 0}
     orig = aiohttp.ClientSession.request
 
     class _Resp:
-        status = 429
         headers = {}
 
-        def __init__(self, body):
-            self._body = body
+        def __init__(self, body, status=429):
+            self._body, self.status = body, status
 
         async def json(self):
             return self._body
 
     class _Ctx:
-        def __init__(self, body):
-            self.body = body
+        def __init__(self, body, status=429):
+            self.body, self.status = body, status
 
         async def __aenter__(self):
-            return _Resp(self.body)
+            return _Resp(self.body, self.status)
 
         async def __aexit__(self, *a):
             return False
@@ -114,10 +116,10 @@ def install_injection(names):
         u = str(url)
         if method.upper() == "POST" and ("/webhooks/" in u or u.endswith("/messages")):
             calls["n"] += 1
-            for lo, hi, secs, glob in windows:
+            for lo, hi, secs, glob, status in windows:
                 if lo <= calls["n"] <= hi:
-                    print(f"  [inject] send-call #{calls['n']}: 429 retry_after={secs}s global={glob}", flush=True)
-                    return _Ctx({"code": "RATE_LIMITED", "message": "injected", "retry_after": secs, "global": glob})
+                    print(f"  [inject] send-call #{calls['n']}: HTTP {status}" + (f" retry_after={secs}s global={glob}" if status == 429 else ""), flush=True)
+                    return _Ctx({"code": "RATE_LIMITED", "message": "injected", "retry_after": secs, "global": glob}, status)
         return orig(self, method, url, **kw)
 
     aiohttp.ClientSession.request = patched
@@ -131,6 +133,9 @@ async def cmd_run(cfg, args):
         install_injection(names)
         if "halt" in names:
             wr._MAX_RECOVERY_ROUNDS = 2   # give up quickly instead of after ~5 minutes
+        if "outage" in names:
+            wr._MAX_RECOVERY_ROUNDS = 1   # one pass per attempt, so a 56-call outage spans many attempts
+            mm.OUTAGE_BACKOFF = (3, 4)    # short pauses so the demonstration doesn't take hours
         print(f"fault injection ON: {names}")
     ctx = make_ctx(cfg, "backup")
     await ctx.start_connections()
@@ -153,6 +158,7 @@ async def cmd_run(cfg, args):
         after_id = ctx.state.get_waterfall_cursor() if args.resume else None
         print(f"waterfall start: after_id={after_id}")
         ctx.writer.on_rate_limit = lambda secs: print(f"  ** rate limited: pausing {secs:.1f}s **", flush=True)
+        ctx.on_notice = lambda t: print("  NOTICE:", t.replace("[yellow]", "").replace("[/yellow]", "").replace("[green]", "").replace("[/green]", "")[:170], flush=True)
         limit = args.stop_after
 
         async def progress(st):
@@ -162,7 +168,7 @@ async def cmd_run(cfg, args):
                 ctx.is_running = False   # simulate the user pressing Cancel
 
         res = await mm.migrate_global_messages(ctx, after_message_id=after_id, progress_callback=progress)
-        print(json.dumps({k: res[k] for k in ("messages", "threads", "attachments")} | {"error": res.get("error")}))
+        print(json.dumps({k: res[k] for k in ("messages", "threads", "attachments")} | {"error": res.get("error"), "skipped": res.get("skipped", 0)}))
         print("final cursor:", ctx.state.get_waterfall_cursor())
     finally:
         ctx.is_running = False

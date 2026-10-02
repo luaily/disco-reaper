@@ -46,6 +46,18 @@ global_rate_limit_expires = 0.0
 logger = logging.getLogger(__name__)
 
 
+class _GlobalMessageLookup:
+    """Lets MessageIDInputModal verify a message ID without knowing its channel (backup source)."""
+
+    def __init__(self, reader):
+        self.reader = reader
+
+    async def get_message(self, channel_id, message_id):
+        db = getattr(self.reader, "db", None)
+        row = db.get_message_with_relations(int(message_id)) if db is not None else None
+        return self.reader._hydrate_message(row) if row else None
+
+
 class RateLimitHandler(logging.Handler):
     """Intercepts library logs to capture rate-limit messages."""
 
@@ -1192,6 +1204,7 @@ class OperationPane(Container):
         if not self.tokens_valid:
             return
 
+        reporter = None      # progress DM reporter (see core/notify.py), created once the totals are known
         migrate_mod = fluxer_migrate if self.target_platform == "fluxer" else stoat_migrate
         platform_name = self.target_platform.capitalize()
 
@@ -1545,7 +1558,12 @@ class OperationPane(Container):
             self._apply_run_options(modal, run_deadline, run_max_rate)
             run_started = time.time()
 
+            from src.core.notify import ProgressReporter
+            reporter = ProgressReporter(self.engine.notify, total_messages, self._speed_cap,
+                                        title=f"#{source_channel.name} → #{target_channel.get('name')}")
+
             async def update_msg(current_stats):
+                reporter.update(current_stats)
                 c_msgs = current_stats["messages"]
                 c_threads = current_stats["threads"]
                 c_files = current_stats["attachments"]
@@ -1578,6 +1596,7 @@ class OperationPane(Container):
                     disp_content = (content[:100] + '...') if len(content) > 100 else content
                     modal.write(f"[bold]{author}:[/bold] {disp_content}")
 
+            reporter.start()
             result = await migrate_mod.migrate_messages(
                 self.engine,
                 source_channel_id=source_channel.id,
@@ -1606,6 +1625,9 @@ class OperationPane(Container):
                 event_title = "Message Migration"
                 modal.phase_report(event_title, "stopped", show_back=False)
 
+            from src.core.notify import describe_result
+            _kind, _text = describe_result(f"#{source_channel.name} → #{target_channel.get('name')}", result, time.time() - run_started)
+            self.engine.notify(_text, kind=_kind, with_logs=(_kind == "error"))
             if result.get("skipped"):
                 ids = ", ".join(result.get("skipped_ids", [])[:10]) + (" ..." if len(result.get("skipped_ids", [])) > 10 else "")
                 modal.write(f"[bold yellow]{result['skipped']} message(s) were skipped after repeated send errors "
@@ -1626,6 +1648,8 @@ class OperationPane(Container):
             logger.error(f"Migration Error: {traceback.format_exc()}")
         finally:
             self.engine.is_running = False
+            if reporter is not None:
+                await reporter.stop()
             self._reset_run_options()
             await self.engine.close_connections()
 
@@ -1657,6 +1681,11 @@ class OperationPane(Container):
                 parts.append(f"max [bold]{max_rate:g}[/bold] msgs/min")
             modal.write("[bold cyan]Run options:[/bold cyan] " + ", ".join(parts))
 
+    def _speed_cap(self) -> float:
+        """The set send speed in messages/minute (0 = no cap)."""
+        interval = getattr(getattr(self.engine, "writer", None), "min_send_interval", 0) or 0
+        return 60.0 / interval if interval else 0.0
+
     def _reset_run_options(self) -> None:
         self.engine.deadline = None
         self.engine.on_notice = None
@@ -1680,6 +1709,7 @@ class OperationPane(Container):
         if not self.tokens_valid:
             return
 
+        reporter = None      # progress DM reporter (see core/notify.py), created once the totals are known
         migrate_mod = fluxer_migrate if self.target_platform == "fluxer" else stoat_migrate
         platform_name = self.target_platform.capitalize()
         
@@ -1837,7 +1867,9 @@ class OperationPane(Container):
             else:
                 choice = await modal.phase_wait_confirm(
                     show_continue=min_last_id is not None,
-                    show_id=False,
+                    show_id=(self.target_platform == "fluxer"),
+                    btn_id_label="Start from\nmessage ID",
+                    btn_id_tooltip="Check the server from a message you pick onward and send only what is missing\n(repairs messages that were skipped)",
                     btn_start_label="Start From Beginning",
                     btn_start_tooltip="Wipes migration progress and restarts from the beginning; may create duplicates",
                     btn_start_variant="default" if min_last_id is not None else "primary",
@@ -1854,6 +1886,32 @@ class OperationPane(Container):
                 await self.engine.close_connections()
                 return
                 
+            # "Start from message ID": every message from there on is checked against the Fluxer SERVER and only the
+            # ones that are really missing get sent (repairs messages that were skipped because of bugs).
+            verify_from = None
+            if choice == "btn_id" and self.target_platform == "fluxer":
+                loop = asyncio.get_running_loop()
+                id_future = loop.create_future()
+                def id_cb(res: int | None) -> None:
+                    if not id_future.done():
+                        id_future.set_result(res)
+                self.app.push_screen(MessageIDInputModal(_GlobalMessageLookup(self.engine.discord_reader), 0), id_cb)
+                verified_id = await id_future
+                if verified_id is None:
+                    modal.dismiss()
+                    await self.engine.close_connections()
+                    return
+                try:
+                    start_msg = await migrate_mod.find_start_message(self.engine, verified_id)
+                except ValueError as e:
+                    modal.write(f"[bold red]{e}[/bold red]")
+                    modal.dismiss()
+                    await self.engine.close_connections()
+                    return
+                verify_from = (int(verified_id), start_msg.created_at.timestamp())
+                modal.write(f"[bold cyan]Starting at message {verified_id}:[/bold cyan] each message from there on is checked "
+                            f"against the Fluxer server and only the missing ones are sent.")
+
             # Optional stop time / rate cap (Fluxer only: that is where deadline + pacing are implemented).
             # Asked BEFORE anything is cleared so backing out never wipes progress.
             run_deadline, run_max_rate = None, 0.0
@@ -1872,6 +1930,8 @@ class OperationPane(Container):
                 after_id = None
             elif choice == "btn_continue" and min_last_id is not None:
                 after_id = int(min_last_id)
+            if verify_from:
+                after_id = verify_from[0] - 1          # inclusive start; the database's progress is ignored
             
             # Phase 3: Progress
             modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
@@ -1891,15 +1951,21 @@ class OperationPane(Container):
 
             modal.show_stats()
             modal.write("Scanning global footprint for totals ...")
-            stats_analysis = await migrate_mod.analyze_global_migration(self.engine, after_message_id=after_id)
+            if verify_from:
+                stats_analysis = await migrate_mod.analyze_global_migration(self.engine, after_message_id=after_id, ignore_progress=True)
+            else:
+                stats_analysis = await migrate_mod.analyze_global_migration(self.engine, after_message_id=after_id)
             total_messages = stats_analysis["messages"]
             
             modal.write(f"[bold cyan]Global Migration Started:[/bold cyan] {total_messages} total messages to process.")
             modal.update_stats(messages=f"0/{total_messages}", threads=str(stats_analysis["threads"]), files=str(stats_analysis["attachments"]))
             
             run_started = time.time()
+            from src.core.notify import ProgressReporter
+            reporter = ProgressReporter(self.engine.notify, total_messages, self._speed_cap, title="Waterfall")
 
             async def update_msg(current_stats):
+                reporter.update(current_stats)
                 c_msgs = current_stats["messages"]
                 c_threads = current_stats["threads"]
                 c_files = current_stats["attachments"]
@@ -1918,12 +1984,16 @@ class OperationPane(Container):
                     disp_content = (content[:100] + '...') if len(content) > 100 else content
                     modal.write(f"[bold]{author}:[/bold] {disp_content}")
 
+            reporter.start()
             result = await migrate_mod.migrate_global_messages(
                 self.engine,
                 after_message_id=after_id,
                 inclusive=False,
                 progress_callback=update_msg,
+                **({"verify_server": True, "start_ts": verify_from[1]} if verify_from else {}),
             )
+            if result.get("already_on_server"):
+                modal.write(f"[bold cyan]{result['already_on_server']} message(s) were already on the server and were not sent again.[/bold cyan]")
 
             if result.get("error"):
                 modal.write(f"[bold red]{result['error']}[/bold red]")
@@ -1940,6 +2010,9 @@ class OperationPane(Container):
                 modal.write(f"[bold yellow]Interrupted! {result['messages']} messages migrated.[/bold yellow]")
                 modal.phase_report("Waterfall Migration", "stopped", show_back=False)
                 
+            from src.core.notify import describe_result
+            _kind, _text = describe_result("Waterfall", result, time.time() - run_started)
+            self.engine.notify(_text, kind=_kind, with_logs=(_kind == "error"))
             if result.get("skipped"):
                 ids = ", ".join(result.get("skipped_ids", [])[:10]) + (" ..." if len(result.get("skipped_ids", [])) > 10 else "")
                 modal.write(f"[bold yellow]{result['skipped']} message(s) were skipped after repeated send errors "
@@ -1958,6 +2031,8 @@ class OperationPane(Container):
             logger.error(traceback.format_exc())
         finally:
             self.engine.is_running = False
+            if reporter is not None:
+                await reporter.stop()
             self._reset_run_options()
             await self.engine.close_connections()
 

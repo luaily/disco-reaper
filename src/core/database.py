@@ -452,10 +452,15 @@ class MigrationDatabase:
         # Initialize if missing
         conn.execute("INSERT OR IGNORE INTO channel_tracking (channel_id) VALUES (?)", (str(channel_id),))
         
+        # Progress only ever moves forward: re-checking or re-sending an older message (start-from-message, repairs)
+        # must not make a later normal resume think the channel is further back and send things twice.
         if last_msg_id:
-            conn.execute("UPDATE channel_tracking SET last_msg_id = ? WHERE channel_id = ?", (str(last_msg_id), str(channel_id)))
+            conn.execute("UPDATE channel_tracking SET last_msg_id = ? WHERE channel_id = ? AND "
+                         "(last_msg_id IS NULL OR CAST(last_msg_id AS INTEGER) < CAST(? AS INTEGER))",
+                         (str(last_msg_id), str(channel_id), str(last_msg_id)))
         if last_msg_ts:
-            conn.execute("UPDATE channel_tracking SET last_msg_ts = ? WHERE channel_id = ?", (last_msg_ts, str(channel_id)))
+            conn.execute("UPDATE channel_tracking SET last_msg_ts = ? WHERE channel_id = ? AND "
+                         "(last_msg_ts IS NULL OR last_msg_ts < ?)", (last_msg_ts, str(channel_id), last_msg_ts))
         
         if msg_inc != 0 or file_inc != 0:
             conn.execute(
@@ -539,9 +544,12 @@ class MigrationDatabase:
         conn.execute("INSERT OR IGNORE INTO thread_tracking (channel_id, thread_id) VALUES (?, ?)", (str(channel_id), str(thread_id)))
         
         if last_msg_id:
-            conn.execute("UPDATE thread_tracking SET last_msg_id = ? WHERE channel_id = ? AND thread_id = ?", (str(last_msg_id), str(channel_id), str(thread_id)))
+            conn.execute("UPDATE thread_tracking SET last_msg_id = ? WHERE channel_id = ? AND thread_id = ? AND "
+                         "(last_msg_id IS NULL OR CAST(last_msg_id AS INTEGER) < CAST(? AS INTEGER))",
+                         (str(last_msg_id), str(channel_id), str(thread_id), str(last_msg_id)))
         if last_msg_ts:
-            conn.execute("UPDATE thread_tracking SET last_msg_ts = ? WHERE channel_id = ? AND thread_id = ?", (last_msg_ts, str(channel_id), str(thread_id)))
+            conn.execute("UPDATE thread_tracking SET last_msg_ts = ? WHERE channel_id = ? AND thread_id = ? AND "
+                         "(last_msg_ts IS NULL OR last_msg_ts < ?)", (last_msg_ts, str(channel_id), str(thread_id), last_msg_ts))
         if completed is not None:
             conn.execute("UPDATE thread_tracking SET completed = ? WHERE channel_id = ? AND thread_id = ?", (completed, str(channel_id), str(thread_id)))
         
@@ -621,6 +629,13 @@ class MigrationDatabase:
             INSERT OR REPLACE INTO skipped_messages (source_id, channel_id, author, reason, attempts, skipped_at)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (str(source_id), str(channel_id), author, (reason or "")[:300], attempts, datetime.now(timezone.utc).isoformat()))
+        conn.execute("DELETE FROM message_attempts WHERE source_id = ?", (str(source_id),))
+        conn.commit()
+
+    def clear_skipped_message(self, source_id):
+        """Forget a skip once the message has been sent properly (or found on the server)."""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM skipped_messages WHERE source_id = ?", (str(source_id),))
         conn.execute("DELETE FROM message_attempts WHERE source_id = ?", (str(source_id),))
         conn.commit()
 

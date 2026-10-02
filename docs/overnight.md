@@ -114,8 +114,16 @@ Ctrl-C (or the app exiting) prints a summary and writes `<out>.summary.txt`; the
 
 To find a rate that avoids 429s entirely, run the migration with a *Max speed* in the Run Options dialog (e.g. 45, then 55, then 65 msgs/min) and compare "429s per migrated message" — the highest cap that stays near zero is your safe ceiling. Fewer 429s means less hammering of the API.
 
+## When Fluxer has a problem (503s, timeouts)
+If Fluxer stops accepting messages the run **holds**: it says why, waits (15s, 30s, 1m, 2m, then every 5 min), checks that
+the API answers again, and retries the *same* message. Nothing is counted against the message and nothing is skipped; the
+first message after the outage is read back from the channel to confirm it arrived. By default it waits as long as it takes
+(use the TUI's Cancel or Ctrl-C to stop). To make an unattended run give up instead, set "Stop if Fluxer is down for (min)"
+on the Configuration screen, `max_outage_minutes` in `reaper_config.yaml`, or `--max-outage N` on `timed_waterfall.py`
+(it then exits with code 1, still without skipping anything).
+
 ## Messages that keep failing
-A send that fails (timeout, outage, rate limit that never clears) is retried, and after **5 attempts** the message is
+A send that fails for a reason about *that message* is retried, and after **5 attempts** the message is
 skipped: the bot posts a marker in the channel ("There was an error migrating message `id` … skipping...") and the run
 carries on, so one bad message can't stall an overnight run. Change the limit on the Configuration screen ("Max send
 attempts per message"), in `reaper_config.yaml` (`max_message_attempts`) or with `--max-attempts N`; `0` = never skip,
@@ -126,3 +134,27 @@ stop at the first failure. List what was skipped with:
 ```
 Upload timeouts grow with the file size, and a send that timed out is looked for in the channel before it is retried,
 so large attachments no longer fail on a fixed 45s limit and a retry won't post a duplicate.
+
+## Getting told about problems (no terminal needed)
+Set your **Fluxer user ID** under "DM me problems (Fluxer user ID)" on the Configuration screen, in `reaper_config.yaml` as
+`notify_user_id`, or pass `--notify-user ID` to `timed_waterfall.py`. The bot that is running the migration then DMs you when
+Fluxer has been down for more than 2 minutes (and when it is back), when a message is skipped, when the run halts, and with a
+summary at the end. It uses the same bot, so there is nothing else to set up; you only need to share the community with it
+and allow DMs. (Find your ID by enabling Developer Mode and copying your user ID.)
+
+### Progress reports
+With a notify user set, the bot also DMs a **start report** (messages to send, the set send speed, estimated time remaining)
+and then a report **at the top of every hour**: sent so far, remaining, the set send speed, the average real send speed and
+the estimated time remaining. Reports keep arriving while the run is paused, so no news is never "unknown". Change the
+cadence with `--report-interval MIN` on `timed_waterfall.py` (`60` = top of the hour, `30` = on the hour and half hour).
+
+## Repairing messages that were skipped or lost
+To go back and fix a range, start from a message and let the server decide what is missing:
+
+```bash
+./venv/bin/python scripts/timed_waterfall.py --profile MyServer --from-message 1349205131891183747
+```
+In the TUI use Waterfall → **Start from message ID**. Every message from that one onward (inclusive) is checked against the
+Fluxer channel itself, not the database; the ones already there are left alone, stale "error migrating" markers for messages
+that are there are deleted, and only the missing ones are sent (at the end of their channel, with the original date in the
+prefix). It can be repeated safely. Use `scripts/list_skipped.py` to see what was skipped.

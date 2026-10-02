@@ -1,4 +1,5 @@
 import asyncio
+import time
 import logging
 import re
 import json
@@ -14,7 +15,7 @@ except ImportError:
     HAS_LOTTIE = False
 
 from src.core.base import MigrationContext
-from src.fluxer.writer import MessageSendError
+from src.fluxer.writer import MessageSendError, ServiceUnavailable
 from src.core.media_links import attach_link_media, embed_refs_link
 from src.core.utils import resolve_discord_links
 
@@ -367,6 +368,11 @@ async def _process_and_send_message(
         logger.warning(f"Message {msg.id}: rejected with saved media attached; retrying with the links as text")
         link_files = []
         fluxer_msg_id = await _send(content, files, msg.embeds)
+    if not fluxer_msg_id:
+        # send_message returns None only for a permanent rejection (it already logged why). Don't let the message
+        # vanish silently: post a marker, record it in skipped_messages, and move on.
+        reason = getattr(context.fluxer_writer, "last_rejection", None) or "rejected by Fluxer"
+        return await _skip_message(context, msg, target_channel_id, reason, 1, stats, thread_id, rejected=True)
     if fluxer_msg_id:
         files = files + link_files
         stats["attachments"] += len(link_files)
@@ -388,7 +394,7 @@ async def _process_and_send_message(
     return fluxer_msg_id
 
 async def _skip_message(context: MigrationContext, msg: Any, target_channel_id: str, reason: str, attempts: int,
-                        stats: Dict[str, Any], thread_id: str | None = None) -> str | None:
+                        stats: Dict[str, Any], thread_id: str | None = None, rejected: bool = False) -> str | None:
     """Gives up on a message that keeps failing: posts a visible marker, records the skip, advances progress."""
     anonymize = context.config.anonymize_users if hasattr(context, "config") else False
     try:
@@ -400,8 +406,9 @@ async def _skip_message(context: MigrationContext, msg: Any, target_channel_id: 
     try:
         marker_id = await context.fluxer_writer.send_marker(
             channel_id=target_channel_id,
-            content=f"⚠️ There was an error migrating message `{msg.id}` from **{author}** (<t:{when}:f>) "
-                    f"after {attempts} attempts, skipping...")
+            content=f"⚠️ There was an error migrating message `{msg.id}` from **{author}** (<t:{when}:f>)"
+                    f"{' (Fluxer rejected it)' if rejected else (f' after {attempts} attempts' if attempts > 1 else '')}"
+                    f", skipping...")
     except Exception as e:
         logger.warning(f"Could not post the skip marker for message {msg.id}: {e}")
     context.state.record_skipped_message(msg.id, getattr(msg.channel, "id", ""), author, reason, attempts)
@@ -419,30 +426,158 @@ async def _skip_message(context: MigrationContext, msg: Any, target_channel_id: 
         context.state.update_last_message_id(target_channel_id, str(msg.id))
     stats["skipped"] = stats.get("skipped", 0) + 1
     stats.setdefault("skipped_ids", []).append(str(msg.id))
-    logger.error(f"Skipped message {msg.id} after {attempts} failed attempts: {reason}")
+    logger.error(f"Skipped message {msg.id} ({'rejected by Fluxer' if rejected else f'{attempts} failed attempts'}): {reason}")
     notice = getattr(context, "on_notice", None)
     if notice:
-        notice(f"[bold yellow]Skipped message {msg.id} after {attempts} failed attempts: {reason}[/bold yellow]")
+        notice(f"[bold yellow]Skipped message {msg.id} ({'rejected by Fluxer' if rejected else f'{attempts} failed attempts'}): {reason}[/bold yellow]")
+    if hasattr(context, "notify"):
+        context.notify(f"Skipped message `{msg.id}` from {author} ({'rejected by Fluxer' if rejected else f'{attempts} failed attempts'}): "
+                       f"{str(reason)[:200]}", kind="warn", key="skip", cooldown=120)
     return marker_id
+
+
+async def find_start_message(context: MigrationContext, message_id: int) -> Any:
+    """Loads the backup message to start from (inclusive). Raises ValueError if it isn't in the backup."""
+    wanted = int(message_id)
+    async for m in context.discord_reader.fetch_global_message_history(after_id=wanted - 1):
+        if m.id == wanted:
+            return m
+        break
+    raise ValueError(f"Message {message_id} is not in the backup")
+
+
+def _author_name_for(context: MigrationContext, msg: Any) -> str:
+    """The name the message is posted under (before the ' (discord)' suffix), exactly as the send path does."""
+    anonymize = context.config.anonymize_users if hasattr(context, "config") else False
+    if anonymize:
+        return context.state.get_user_alias(str(msg.author.id)) or "Anonymized User"
+    return msg.author.display_name
+
+
+async def _find_on_server(context: MigrationContext, index: Any, msg: Any, target_channel_id: str) -> str | None:
+    """ID of a copy of `msg` already on the Fluxer channel (read from the server), or None."""
+    try:
+        return await index.find(target_channel_id, f"{_author_name_for(context, msg)} (discord)", int(msg.created_at.timestamp()))
+    except Exception as e:
+        raise ServiceUnavailable(f"Could not read channel {target_channel_id} from Fluxer to check for existing messages: {e}") from e
+
+
+async def _drop_stale_marker(context: MigrationContext, index: Any, msg: Any, target_channel_id: str) -> None:
+    """The message is now on the server for real: remove the bot's old 'error migrating ... skipping' marker for it."""
+    marker = index.marker_for(target_channel_id, msg.id)
+    if marker:
+        if await context.fluxer_writer.delete_message(target_channel_id, marker):
+            logger.info(f"Deleted stale skip marker {marker} for message {msg.id}")
+    context.state.clear_skipped_message(msg.id)
+
+
+async def _adopt_existing(context: MigrationContext, index: Any, msg: Any, target_channel_id: str, server_id: str,
+                          stats: Dict[str, Any]) -> None:
+    """The message is already on the server: make the database agree (so replies and links resolve to the real
+    message), remove any stale skip marker, and move on without sending anything."""
+    context.state.set_message_mapping(target_channel_id, str(msg.id), server_id)
+    context.state.update_last_message_timestamp(target_channel_id, str(msg.created_at))
+    context.state.update_last_message_id(target_channel_id, str(msg.id))
+    await _drop_stale_marker(context, index, msg, target_channel_id)
+    stats["already_on_server"] = stats.get("already_on_server", 0) + 1
+
+
+OUTAGE_BACKOFF = (15, 30, 60, 120, 300)   # seconds between health checks while Fluxer is down; the last value repeats
+
+
+def _fmt_secs(n: float) -> str:
+    n = int(n)
+    return f"{n // 3600}h{(n % 3600) // 60:02d}m" if n >= 3600 else (f"{n // 60}m{n % 60:02d}s" if n >= 60 else f"{n}s")
+
+
+async def _sleep_checked(context: MigrationContext, seconds: float) -> bool:
+    """Sleeps in 1s steps; False if the run was cancelled or reached its stop time meanwhile."""
+    for _ in range(int(seconds)):
+        if not context.is_running or context.deadline_reached():
+            return False
+        await asyncio.sleep(1)
+    return context.is_running and not context.deadline_reached()
+
+
+async def _wait_for_service(context: MigrationContext, target_channel_id: str, msg: Any, error: Exception,
+                            outage_started: float, step: int) -> int:
+    """Holds the run (nothing is retried, counted or skipped) until Fluxer answers again.
+
+    Backs off 15s, 30s, 60s, 2m, 5m... and probes the API between waits. Returns the backoff step to continue from.
+    Raises MessageSendError if the run is cancelled / hits its stop time, or if config.max_outage_minutes (0 = keep
+    waiting forever) is exceeded; in every case the message stays unmarked, so a resume retries it."""
+    notice = getattr(context, "on_notice", None)
+    max_minutes = int(getattr(getattr(context, "config", None), "max_outage_minutes", 0) or 0)
+    detail = str(error)
+    dm_sent = False
+    while True:
+        delay = OUTAGE_BACKOFF[min(step, len(OUTAGE_BACKOFF) - 1)]
+        step += 1
+        down_for = time.time() - outage_started
+        logger.warning(f"Fluxer unavailable ({detail}); paused {_fmt_secs(down_for)} so far; message {msg.id} will be retried "
+                       f"when it answers (next check in {delay}s)")
+        if notice:
+            notice(f"[yellow]Fluxer isn't accepting messages ({detail[:110]}). Paused for {_fmt_secs(down_for)}; "
+                   f"checking again in {_fmt_secs(delay)}. Message {msg.id} is waiting, nothing is skipped.[/yellow]")
+        if down_for >= 120 and hasattr(context, "notify"):      # a blip isn't worth a message; a real outage is
+            dm_sent = context.notify(
+                f"Fluxer isn't accepting messages ({detail[:160]}). The migration is paused on message `{msg.id}` "
+                f"({_fmt_secs(down_for)} so far) and will resume by itself. Nothing is skipped.",
+                kind="warn", key="outage", cooldown=1800, with_logs=True) or dm_sent
+        if not await _sleep_checked(context, delay):
+            raise MessageSendError("Cancelled while waiting for Fluxer to recover")
+        if max_minutes and (time.time() - outage_started) > max_minutes * 60:
+            raise MessageSendError(f"Fluxer has been unavailable for over {max_minutes} minutes ({detail}); stopping so "
+                                   f"nothing is skipped. Message {msg.id} was not migrated.")
+        healthy, detail = await context.fluxer_writer.check_health(target_channel_id)
+        if healthy:
+            logger.info(f"Fluxer answers again after {_fmt_secs(time.time() - outage_started)}; retrying message {msg.id}")
+            if notice:
+                notice(f"[green]Fluxer is answering again. Retrying message {msg.id}...[/green]")
+            if dm_sent and hasattr(context, "notify"):
+                context.notify(f"Fluxer is answering again after {_fmt_secs(time.time() - outage_started)}; "
+                               f"the migration is resuming at message `{msg.id}`.", kind="ok", key="recovered", cooldown=600)
+            return step
 
 
 async def _process_with_retries(context: MigrationContext, msg: Any, target_channel_id: str, stats: Dict[str, Any],
                                 **kwargs) -> str | None:
-    """_process_and_send_message, but a message that keeps failing to send is retried and finally skipped.
+    """_process_and_send_message with two different answers to failure.
 
-    Failed tries are counted per message in the migration DB (so they survive restarts) against
-    config.max_message_attempts (default 5; 0 = never skip, halt as before). A cancel or the scheduled stop time is
-    not the message's fault and is never counted."""
+    * The SERVICE is struggling (503/5xx, timeouts, connection errors, uploads or rate limits that never clear):
+      this says nothing about the message. The run HOLDS, backing off and probing Fluxer, then retries the same
+      message. Nothing is counted against the message and nothing is skipped. The first message sent after an
+      outage is read back from the channel to confirm it really exists. `max_outage_minutes` (default 0 = wait
+      as long as it takes) stops the run, still without skipping, if the outage lasts too long.
+    * A failure that is about the MESSAGE (anything else raised as MessageSendError) is counted per message in the
+      migration DB (survives restarts) against `max_message_attempts` (default 5; 0 = never skip) and then skipped
+      with a marker.
+    A cancel or the scheduled stop time is never counted."""
     max_attempts = int(getattr(getattr(context, "config", None), "max_message_attempts", 5) or 0)
     notice = getattr(context, "on_notice", None)
     failed_here = False
+    outage_started: float | None = None
+    outage_step = 0
     while True:
         try:
             result = await _process_and_send_message(context=context, msg=msg, target_channel_id=target_channel_id,
                                                      stats=stats, **kwargs)
+            if outage_started is not None and result:
+                # first message after an outage: make sure it is really there before moving on
+                if await context.fluxer_writer.verify_message(target_channel_id, result) is False:
+                    logger.warning(f"Message {msg.id}: Fluxer returned {result} but it is not in the channel; resending")
+                    stats["messages"] = max(0, stats.get("messages", 0) - 1)
+                    continue
+                outage_started, outage_step = None, 0
             if failed_here:
                 context.state.clear_message_attempts(msg.id)
             return result
+        except ServiceUnavailable as e:
+            if not context.is_running or context.deadline_reached():
+                raise
+            if outage_started is None:
+                outage_started = time.time()
+            outage_step = await _wait_for_service(context, target_channel_id, msg, e, outage_started, outage_step)
         except MessageSendError as e:
             if max_attempts <= 0 or not context.is_running or context.deadline_reached():
                 raise
@@ -455,10 +590,7 @@ async def _process_with_retries(context: MigrationContext, msg: Any, target_chan
             logger.warning(f"Message {msg.id} failed ({e}); attempt {attempts}/{max_attempts}, retrying in {delay}s")
             if notice:
                 notice(f"[yellow]Message {msg.id} failed ({e}). Attempt {attempts}/{max_attempts}; retrying in {delay}s...[/yellow]")
-            for _ in range(delay):
-                if not context.is_running or context.deadline_reached():
-                    break
-                await asyncio.sleep(1)
+            await _sleep_checked(context, delay)
 
 
 async def analyze_migration(context: MigrationContext, source_channel_id: int, after_message_id: int | None = None, inclusive: bool = False, progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None, processed_threads: set | None = None) -> Dict[str, int]:
@@ -929,12 +1061,19 @@ async def migrate_messages(
                 if context.deadline_reached():
                     logger.info(f"Scheduled stop time reached while sending message {msg.id}; it was not marked migrated.")
                     stats["stopped"] = "deadline"
+                elif str(e).startswith("Cancelled"):
+                    logger.info(f"Cancelled by the user at message {msg.id}; it was not marked migrated.")
                 else:
                     logger.error(f"Migration halted at message {msg.id}: {e}")
                     stats["error"] = f"Halted at message {msg.id}: {e}"
+                    if hasattr(context, "notify"):
+                        context.notify(f"Migration halted at message `{msg.id}`: {e}", kind="error", key="halt", with_logs=True)
                 break
             except Exception as e:
                 logger.error(f"Failed to process message {msg.id}: {e}")
+                if hasattr(context, "notify"):
+                    context.notify(f"Unexpected error on message `{msg.id}` (it was left unmigrated and the run continued): {e}",
+                                   kind="warn", key="exc", cooldown=300, with_logs=True)
                 import traceback
                 logger.error(traceback.format_exc())
         
@@ -951,7 +1090,7 @@ async def migrate_messages(
     return stats
 
 
-async def analyze_global_migration(context: MigrationContext, after_message_id: int | None = None, inclusive: bool = False, progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None) -> Dict[str, int]:
+async def analyze_global_migration(context: MigrationContext, after_message_id: int | None = None, inclusive: bool = False, progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None, ignore_progress: bool = False) -> Dict[str, int]:
     """
     Scans the entire server history to count messages, threads, and attachments globally.
     """
@@ -977,7 +1116,7 @@ async def analyze_global_migration(context: MigrationContext, after_message_id: 
         # Efficient skip: if message ID is <= last migrated ID for this channel/thread
         # This is the primary resume mechanism: wait until we pass the last migrated ID for this channel
         last_id = progress_map.get(str(target_channel_id))
-        if last_id and msg.id <= int(last_id):
+        if last_id and msg.id <= int(last_id) and not ignore_progress:
             continue
             
         if msg.type not in [
@@ -1017,10 +1156,17 @@ async def migrate_global_messages(
     context: MigrationContext,
     after_message_id: int | None = None,
     inclusive: bool = False,
-    progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None
+    progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None,
+    verify_server: bool = False,
+    start_ts: float | None = None,
 ) -> Dict[str, Any]:
     """
     Migrates messages across all channels chronologically to Fluxer.
+
+    verify_server=True ("start from message X"): the database's progress is ignored. Each message is looked up on the
+    Fluxer channel itself (see server_index.py) and only sent if it really isn't there; messages found there are
+    adopted (mapping repaired) and any stale skip marker for them is deleted. `start_ts` = creation time (epoch s)
+    of the first message, which bounds how far back each channel is read.
     """
     stats = {
         "messages": 0,
@@ -1037,6 +1183,13 @@ async def migrate_global_messages(
     
     # Fetch global progress map to skip migrated messages efficiently
     progress_map = context.state.get_all_last_message_ids()
+
+    index = None
+    if verify_server:
+        from src.fluxer.server_index import ServerIndex
+        index = ServerIndex(context.fluxer_writer, start_ts, bot_username=context.fluxer_writer.bot_username())
+        stats["already_on_server"] = 0
+        logger.info("Waterfall in verify mode: checking each message against the server before sending")
 
     try:
         async for msg in context.discord_reader.fetch_global_message_history(after_id=after_message_id):
@@ -1072,7 +1225,7 @@ async def migrate_global_messages(
             # Efficient skip: if message ID is <= last migrated ID for this channel/thread
             # This ensures we only resume a channel once we reach its last known progress point
             last_id = progress_map.get(str(target_channel_id))
-            if last_id and msg.id <= int(last_id):
+            if last_id and msg.id <= int(last_id) and not verify_server:
                 continue
                 
             # If it's a thread message, we need to handle it based on if it's the thread starter or a reply
@@ -1081,13 +1234,20 @@ async def migrate_global_messages(
                 stats["threads"] += 1
 
             try:
-                await _process_with_retries(
-                    context=context,
-                    msg=msg,
-                    target_channel_id=target_channel_id,
-                    stats=stats,
-                    processed_threads=processed_threads
-                )
+                existing = await _find_on_server(context, index, msg, target_channel_id) if verify_server else None
+                if existing:
+                    await _adopt_existing(context, index, msg, target_channel_id, existing, stats)
+                else:
+                    skipped_before = stats.get("skipped", 0)
+                    await _process_with_retries(
+                        context=context,
+                        msg=msg,
+                        target_channel_id=target_channel_id,
+                        stats=stats,
+                        processed_threads=processed_threads
+                    )
+                    if verify_server and stats.get("skipped", 0) == skipped_before:
+                        await _drop_stale_marker(context, index, msg, target_channel_id)
 
                 if not stats["first_message_url"]:
                     stats["first_message_url"] = msg.jump_url
@@ -1103,12 +1263,19 @@ async def migrate_global_messages(
                 if context.deadline_reached():
                     logger.info(f"Scheduled stop time reached while sending message {msg.id}; it was not marked migrated.")
                     stats["stopped"] = "deadline"
+                elif str(e).startswith("Cancelled"):
+                    logger.info(f"Cancelled by the user at message {msg.id}; it was not marked migrated.")
                 else:
                     logger.error(f"Waterfall halted at message {msg.id}: {e}")
                     stats["error"] = f"Halted at message {msg.id}: {e}"
+                    if hasattr(context, "notify"):
+                        context.notify(f"Waterfall halted at message `{msg.id}`: {e}", kind="error", key="halt", with_logs=True)
                 break
             except Exception as e:
                 logger.error(f"Failed to process global message {msg.id}: {e}")
+                if hasattr(context, "notify"):
+                    context.notify(f"Unexpected error on message `{msg.id}` (it was left unmigrated and the run continued): {e}",
+                                   kind="warn", key="exc", cooldown=300, with_logs=True)
 
             # Message is fully handled (sent, or deliberately skipped/rejected): everything up to and
             # including this ID is done. This is the resume point.

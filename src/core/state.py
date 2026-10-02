@@ -260,6 +260,10 @@ class MigrationState:
         if self._ensure_db():
             self.db.record_skipped_message(source_id, channel_id, author, reason, attempts)
 
+    def clear_skipped_message(self, source_id):
+        if self._ensure_db():
+            self.db.clear_skipped_message(source_id)
+
     def get_skipped_messages(self) -> list:
         return self.db.get_skipped_messages() if self._ensure_db() else []
 
@@ -276,8 +280,11 @@ class MigrationState:
         return None
 
     def set_waterfall_cursor(self, message_id: int | str):
+        """Only ever moves forward (re-checking an older message must not pull the resume point back)."""
         if self._ensure_db():
-            self.db.set_metadata("waterfall_cursor", str(message_id))
+            cur = self.get_waterfall_cursor()
+            if cur is None or int(message_id) > cur:
+                self.db.set_metadata("waterfall_cursor", str(message_id))
             
     def get_all_last_message_ids(self) -> Dict[str, str]:
         """Returns a combined map of channel_id/thread_id -> last_msg_id."""

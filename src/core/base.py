@@ -64,6 +64,8 @@ class MigrationContext:
         self.deadline: float | None = None
         # Optional UI hook for human-readable run notices (retries, skipped messages): callable(str)
         self.on_notice = None
+        # Optional DM notifications from the migration bot (config.notify_user_id; Fluxer only), see core/notify.py
+        self.notifier = None
         # Lets the writer abort rate-limit waits when the user cancels or the deadline passes
         self.writer.stop_check = lambda: (not self.is_running) or self.deadline_reached()
 
@@ -176,12 +178,26 @@ class MigrationContext:
     async def start_connections(self):
         await self.discord_reader.start()
         await self.writer.start()
+        user_id = getattr(self.config, "notify_user_id", None)
+        if user_id and self.target_platform == "fluxer" and self.notifier is None:
+            from src.core.notify import FluxerNotifier
+            self.notifier = FluxerNotifier(self.writer, str(user_id).strip())
+
+    def notify(self, text: str, **kwargs) -> bool:
+        """DM the configured Fluxer user (no-op when notifications aren't set up). See core/notify.py."""
+        return self.notifier.notify(text, **kwargs) if self.notifier else False
 
     async def start_target_only(self):
         """Starts only the target platform writer (used for Danger Zone operations that don't need Discord)."""
         await self.writer.start()
 
     async def close_connections(self):
+        if self.notifier is not None:
+            try:
+                await self.notifier.flush()
+            except Exception as e:
+                logger.debug(f"Error flushing notifications: {e}")
+            self.notifier = None
         try:
             await self.discord_reader.close()
         except Exception as e:

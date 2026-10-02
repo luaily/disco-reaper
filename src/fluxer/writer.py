@@ -6,6 +6,7 @@ import re
 import time
 from typing import Optional, List, Dict, Any, Callable
 from fluxer import Bot, Webhook, Forbidden, File
+from src.fluxer.uploads import FileTooLarge, PresignedUploader, PresignRejected, PresignUnavailable, UploadError
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ def _redact(text) -> str:
 
 _ASSUMED_UPLOAD_BPS = 100_000      # assume at least ~100 KB/s up so big attachments aren't timed out too early
 _DELIVERY_LOOKBACK_S = 180         # how far back to look for a message whose send "timed out"
+_UPLOAD_ROUNDS = 3                # pause-and-retry rounds for a transient upload failure (5s, 10s, 20s)
 
 
 def _upload_timeout(files) -> float:
@@ -40,7 +42,13 @@ class MessageSendError(Exception):
     migrated, so a resume retries it instead of skipping it."""
 
 
-class SendTimeout(MessageSendError):
+class ServiceUnavailable(MessageSendError):
+    """The service is struggling (503/5xx, timeouts, connection errors, rate limits or uploads that never clear). This says
+    nothing about the message itself, so callers must pause and retry the SAME message rather than count it as a failure
+    or skip it."""
+
+
+class SendTimeout(ServiceUnavailable):
     """The send timed out with no rate limit active: the message may or may not have been delivered."""
 
 
@@ -68,6 +76,14 @@ class FluxerWriter:
         self.stop_check: Optional[Callable[[], bool]] = None          # returns True when the run was cancelled
         self.min_send_interval: float = 0.0   # optional self-imposed pacing (seconds between sends); 0 = off
         self._last_send_at: float = 0.0
+        # Attachments go straight to Fluxer's object storage (presigned URLs) instead of through the API servers;
+        # turned off automatically for an instance that doesn't offer it, then the old multipart form is used.
+        self.presigned_uploads: bool = True
+        self._storage_session = None
+        # Fluxer refuses files over this size (52,428,800 B on the public instance; learned from the API if it differs).
+        # Bigger files are left out of the message with a visible note instead of failing the whole message.
+        self.max_file_bytes: int = 50 * 1024 * 1024
+        self.last_rejection: Optional[str] = None     # why the last send_message returned None (permanent rejection)
         self._rl_handler: Optional[_RateLimitLogHandler] = None
         self.token = token
         self.community_id = str(community_id)
@@ -309,13 +325,22 @@ class FluxerWriter:
         self._channels_cache = await self.client.get_guild_channels(self.community_id)
         return self._channels_cache
 
-    async def send_message(self, channel_id: str, author_name: str, content: str, timestamp: int, author_avatar_url: Optional[str] = None, files: Optional[List[Dict[str, Any]]] = None, reply_to_message_id: Optional[str] = None, is_forwarded: bool = False, embeds: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    async def send_message(self, channel_id: str, author_name: str, content: str, timestamp: int, author_avatar_url: Optional[str] = None, files: Optional[List[Dict[str, Any]]] = None, reply_to_message_id: Optional[str] = None, is_forwarded: bool = False, embeds: Optional[List[Dict[str, Any]]] = None, _limit_retry: bool = False) -> Optional[str]:
         """
         Sends a message to the target channel.
         Uses a webhook to mimic the original author if possible.
         Returns the ID of the sent message if available.
         """
         assert self.client is not None
+        self.last_rejection = None
+        # Files over Fluxer's per-file limit can never be uploaded: leave them out and say so in the message.
+        if files:
+            too_big = [f for f in files if len(f["data"]) > self.max_file_bytes]
+            if too_big:
+                files = [f for f in files if len(f["data"]) <= self.max_file_bytes] or None
+                content = ((content + "\n") if content else "") + "\n".join(
+                    f"-# ⚠ not migrated, larger than Fluxer's {self.max_file_bytes / 1048576:.0f} MB file limit: "
+                    f"`{f['filename']}` ({len(f['data']) / 1048576:.1f} MB)" for f in too_big)
         logger.debug(f"Fluxer: send_message called for channel {channel_id}, author='{author_name}', content_len={len(content) if content else 0}, files={len(files) if files else 0}, is_forwarded={is_forwarded}")
         
         # Ensure we are ready before sending (wait a bit if needed)
@@ -376,20 +401,43 @@ class FluxerWriter:
         can_ref_via_webhook = bool(webhook and reply_to_message_id and hasattr(self.client, "_route"))
         use_reference = True
 
+        # Files are stored first (presigned upload); the message itself is then a small JSON request that references
+        # them. A failed upload can't have delivered anything, and a retried POST never re-sends the files.
+        await self._pace()
+        uploaded = None
+        if files and webhook and self.presigned_uploads and hasattr(self.client, "_route"):
+            try:
+                uploaded = await self._upload_with_recovery(channel_id, files)
+            except FileTooLarge as e:
+                # Our idea of the limit was too generous for this instance/plan: learn it, drop the offenders, resend.
+                if e.limit and e.limit < self.max_file_bytes and not _limit_retry:
+                    logger.warning(f"Fluxer: per-file limit is {e.limit} bytes; leaving larger files out of messages")
+                    self.max_file_bytes = e.limit
+                    return await self.send_message(channel_id, author_name, content, timestamp, author_avatar_url, files,
+                                                   reply_to_message_id, is_forwarded, embeds, _limit_retry=True)
+                self.last_rejection = f"a file exceeds Fluxer's per-file limit ({e.limit or 'unknown'} bytes)"
+                logger.error(f"Fluxer rejected message for channel {channel_id}: {self.last_rejection}")
+                return None
+            except PresignRejected as e:
+                logger.warning(f"Fluxer: presigned upload refused for this message ({_redact(e)}); using the multipart form for it")
+        use_uploaded = uploaded is not None
+
         async def _attempt() -> Optional[str]:
             fluxer_files = _build_files()
             if webhook and not (reply_to_message_id and not can_ref_via_webhook):
                 username = f"{author_name} (discord)"
-                if reply_to_message_id and use_reference:
-                    logger.debug(f"Fluxer: Sending reply via webhook {webhook.id} for user '{author_name}'")
-                    return await self._webhook_execute_with_reference(
-                        webhook, content=final_content, username=username, avatar_url=author_avatar_url,
-                        files=files, embeds=normalized_embeds,
-                        message_reference={"message_id": str(reply_to_message_id), "channel_id": str(channel_id)})
-                logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}'")
+                ref = ({"message_id": str(reply_to_message_id), "channel_id": str(channel_id)}
+                       if (reply_to_message_id and use_reference) else None)
                 body = final_content
-                if reply_to_message_id:      # reference was rejected: keep a visible trace of the reply
+                if reply_to_message_id and not ref:      # reference was rejected: keep a visible trace of the reply
                     body = "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content
+                if (ref or use_uploaded) and hasattr(self.client, "_route"):
+                    logger.debug(f"Fluxer: Sending {'reply' if ref else 'message'} via webhook {webhook.id} for user '{author_name}'")
+                    return await self._webhook_execute(
+                        webhook, content=body, username=username, avatar_url=author_avatar_url,
+                        embeds=normalized_embeds, message_reference=ref,
+                        attachments=uploaded if use_uploaded else None, files=None if use_uploaded else files)
+                logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}'")
                 msg = await webhook.send(
                     content=body,
                     username=username,
@@ -426,33 +474,51 @@ class FluxerWriter:
             msg_data = await self.client.send_message(**kwargs)
             return str(msg_data["id"]) if msg_data else None
 
-        await self._pace()
-        send_timeout = _upload_timeout(files)
         started = time.time()
         try:
-            try:
-                return await self._send_with_recovery(_attempt, channel_id, send_timeout)
-            except SendTimeout:
-                # The request may have gone through even though we never saw the answer. Look for it before
-                # anyone retries, otherwise a retry would post a duplicate.
-                if webhook:
-                    found = await self._find_delivered(
-                        channel_id, started, f"{author_name} (discord)",
-                        {final_content, "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content})
-                    if found:
-                        logger.warning(f"Fluxer: send to {channel_id} timed out but the message was delivered ({found}); not retrying")
-                        return found
-                raise
-            except MessageSendError:
-                raise
-            except Exception as e:
-                status = getattr(e, "status", None)
-                if can_ref_via_webhook and use_reference and isinstance(status, int) and 400 <= status < 500:
-                    logger.warning(f"Fluxer: reply reference rejected ({status}) for channel {channel_id}; "
-                                   f"retrying without the reply link")
-                    use_reference = False
+            while True:
+                # Uploaded files make the POST tiny, so it gets the normal timeout; otherwise it carries the payload.
+                send_timeout = _SEND_TIMEOUT if use_uploaded else _upload_timeout(files)
+                try:
                     return await self._send_with_recovery(_attempt, channel_id, send_timeout)
-                raise
+                except SendTimeout:
+                    # The request may have gone through even though we never saw the answer. Look for it before
+                    # anyone retries, otherwise a retry would post a duplicate.
+                    if webhook:
+                        found = await self._find_delivered(
+                            channel_id, started, f"{author_name} (discord)",
+                            {final_content, "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content})
+                        if found:
+                            logger.warning(f"Fluxer: send to {channel_id} timed out but the message was delivered ({found}); not retrying")
+                            return found
+                    raise
+                except MessageSendError:
+                    raise
+                except Exception as e:
+                    status = getattr(e, "status", None)
+                    rejected = isinstance(status, int) and 400 <= status < 500
+                    if rejected and can_ref_via_webhook and use_reference:
+                        logger.warning(f"Fluxer: reply reference rejected ({status}) for channel {channel_id}; "
+                                       f"retrying without the reply link")
+                        use_reference = False
+                        continue
+                    if status == 413 and files:
+                        # Payload too large for the edge in front of the API (the multipart form carries every file
+                        # byte): send the text without the files rather than losing the whole message.
+                        logger.warning(f"Fluxer: 413 payload too large for channel {channel_id}; resending without "
+                                       f"{len(files)} attachment(s)")
+                        note = "-# ⚠ attachments not migrated (too large to upload): " + ", ".join(
+                            f"`{f['filename']}`" for f in files)
+                        display_content = ((display_content + "\n") if display_content else "") + note
+                        final_content = prefix + display_content
+                        files, uploaded, use_uploaded = None, None, False
+                        continue
+                    if rejected and use_uploaded:
+                        logger.warning(f"Fluxer: message with presigned attachments rejected ({status}) for channel "
+                                       f"{channel_id}; retrying with the multipart upload")
+                        use_uploaded = False
+                        continue
+                    raise
         except MessageSendError:
             raise
         except Exception as e:
@@ -462,7 +528,96 @@ class FluxerWriter:
             if hasattr(e, 'errors') and e.errors:
                 err_msg += f" - Details: {e.errors}"
             logger.error(err_msg)
+            self.last_rejection = _redact(e)
             return None
+
+    # ── attachments: presigned upload phase ────────────────────────────────
+
+    async def _upload_with_recovery(self, channel_id: str, files: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        """Stores the files via presigned URLs. Returns attachment descriptors, or None if this instance doesn't offer
+        presigned uploads (the caller then uses the multipart form). Transient failures are paused-and-retried;
+        raises MessageSendError if they never clear (nothing has been posted at that point)."""
+        import aiohttp
+        if self._storage_session is None or self._storage_session.closed:
+            self._storage_session = aiohttp.ClientSession()      # no Authorization header: storage URLs are presigned
+        last = None
+        for round_ in range(_UPLOAD_ROUNDS):
+            if self._cancelled():
+                raise MessageSendError("Cancelled during upload")
+            try:
+                uploader = PresignedUploader(self.client, self._storage_session, cancelled=self._cancelled)
+                return await uploader.upload(channel_id, files)
+            except PresignUnavailable as e:
+                logger.warning(f"Fluxer: presigned uploads unavailable ({_redact(e)}); using the multipart upload instead")
+                self.presigned_uploads = False
+                return None
+            except UploadError as e:
+                last = e
+                if self._cancelled():
+                    raise MessageSendError("Cancelled during upload") from e
+                delay = min(60.0, 5.0 * (2 ** round_))
+                logger.warning(f"Fluxer: upload failed ({_redact(e)}); pausing {delay:.0f}s then retrying")
+                if self.on_rate_limit:
+                    try:
+                        self.on_rate_limit(delay)
+                    except Exception:
+                        pass
+                waited = 0.0
+                while waited < delay:
+                    if self._cancelled():
+                        raise MessageSendError("Cancelled while waiting to retry the upload")
+                    await asyncio.sleep(1.0)
+                    waited += 1.0
+        raise ServiceUnavailable(f"Upload to Fluxer storage failed after {_UPLOAD_ROUNDS} rounds: {_redact(last)}")
+
+    def bot_username(self) -> Optional[str]:
+        """The migration bot's own username (to recognise its messages), if known."""
+        try:
+            return self.bot.user.username
+        except Exception:
+            return None
+
+    async def delete_message(self, channel_id: str, message_id: str) -> bool:
+        """Deletes one message (used to remove a stale skip marker). False if it couldn't be."""
+        try:
+            await self.client.delete_message(channel_id, message_id)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not delete message {message_id} in {channel_id}: {_redact(e)}")
+            return False
+
+    async def check_health(self, channel_id: str) -> tuple:
+        """Is the API answering normally right now? -> (healthy, detail). One light GET of the channel (and of the
+        channel's webhook when we have one), no library retries and a 15s limit, so a hung API can't hang the check.
+        An unexpected 4xx counts as healthy: the service is up, the problem is something else."""
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            session = await self.client._ensure_session()
+            routes = [self.client._route("GET", "/channels/{channel_id}", channel_id=channel_id)]
+            hook = self._webhooks.get(str(channel_id))
+            if hook is not None:
+                routes.append(self.client._route("GET", "/webhooks/{webhook_id}/{token}", webhook_id=hook.id, token=hook.token))
+            for route in routes:
+                async with session.request(route.method, route.url, timeout=timeout) as r:
+                    if r.status == 429:
+                        return False, "rate limited (429)"
+                    if r.status >= 500:
+                        return False, f"server error {r.status}"
+            return True, "ok"
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            return False, f"{type(e).__name__}: {_redact(e)}"[:140]
+        except Exception as e:                              # e.g. a client without the route helpers
+            return True, f"health check skipped ({type(e).__name__})"
+
+    async def verify_message(self, channel_id: str, message_id: str) -> Optional[bool]:
+        """Reads a just-sent message back. True = it exists, False = Fluxer says it does not (404),
+        None = couldn't tell (treat as fine: the API already returned its id)."""
+        try:
+            await self.client.get_message(channel_id, message_id)
+            return True
+        except Exception as e:
+            return False if getattr(e, "status", None) == 404 else None
 
     async def _find_delivered(self, channel_id: str, since_ts: float, username: str, bodies: set) -> Optional[str]:
         """After a timed-out send: the ID of a recent message in the channel that is exactly what we tried to
@@ -478,18 +633,24 @@ class FluxerWriter:
                 return str(m["id"])
         return None
 
-    async def _webhook_execute_with_reference(self, webhook, *, content, username, avatar_url, files, embeds,
-                                              message_reference) -> Optional[str]:
-        """POST /webhooks/{id}/{token} with a message_reference (native reply as the webhook identity)."""
+    async def _webhook_execute(self, webhook, *, content, username, avatar_url, embeds, message_reference=None,
+                               attachments=None, files=None) -> Optional[str]:
+        """POST /webhooks/{id}/{token} directly (fluxer.py's Webhook.send can't carry a reply reference or presigned
+        attachments). `attachments` = descriptors from PresignedUploader (plain JSON); `files` = legacy multipart."""
         import aiohttp
         route = self.client._route("POST", "/webhooks/{webhook_id}/{token}", webhook_id=webhook.id, token=webhook.token)
-        payload: Dict[str, Any] = {"content": content, "username": username, "message_reference": message_reference}
+        payload: Dict[str, Any] = {"content": content, "username": username}
+        if message_reference:
+            payload["message_reference"] = message_reference
         if avatar_url:
             payload["avatar_url"] = avatar_url
         if embeds:
             payload["embeds"] = embeds
         params = {"wait": "true"}
-        if files:
+        if attachments:
+            payload["attachments"] = attachments
+            res = await self.client.request(route, json=payload, params=params)
+        elif files:
             form = aiohttp.FormData()
             payload["attachments"] = [{"id": i, "filename": f["filename"]} for i, f in enumerate(files)]
             form.add_field("payload_json", json.dumps(payload), content_type="application/json")
@@ -583,8 +744,11 @@ class FluxerWriter:
                 status = getattr(e, "status", None)
                 if isinstance(status, int) and 400 <= status < 500:
                     raise  # permanent rejection
+                import aiohttp
+                if isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError, OSError)) or (isinstance(status, int) and status >= 500):
+                    raise ServiceUnavailable(f"Send to channel {channel_id} failed ({type(e).__name__}): {_redact(e)}") from e
                 raise MessageSendError(f"Send failed for channel {channel_id}: {_redact(e)}") from e
-        raise MessageSendError(f"Gave up sending to channel {channel_id} after {_MAX_RECOVERY_ROUNDS} rate-limit/outage retries")
+        raise ServiceUnavailable(f"Gave up sending to channel {channel_id} after {_MAX_RECOVERY_ROUNDS} rate-limit/outage retries")
 
     async def send_marker(self, channel_id: str, content: str, files: list[dict] | None = None, reply_to_message_id: Optional[str] = None) -> Optional[str]:
         """
@@ -936,6 +1100,12 @@ class FluxerWriter:
         bot = self.bot
         self.bot = None # Atomic clear
         self._channels_cache = None
+        if self._storage_session is not None:
+            try:
+                await self._storage_session.close()
+            except Exception:
+                pass
+            self._storage_session = None
         self._webhooks.clear()
 
         if bot:

@@ -271,3 +271,31 @@ async def test_waterfall_continues_past_a_skipped_message(monkeypatch):
     res = await mm.migrate_global_messages(ctx)
     assert sent == [1, 3] and res["messages"] == 2 and res["skipped"] == 1 and "error" not in res
     assert ctx.state.cursor == 3 and ctx.state.skipped[0][0] == "2"
+
+
+# ── a permanent rejection is no longer silent ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_rejected_message_is_skipped_with_a_marker_not_silently_dropped():
+    ctx = _ctx(5)
+    ctx.discord_reader = types.SimpleNamespace(guild=None, db=None, backup_path=None)
+    ctx.state.emoji_map, ctx.state.channel_map = {}, {}
+    ctx.fluxer_writer.community_id = "1"
+    sent = []
+
+    async def rejecting(**kw):
+        sent.append(kw)
+        return None
+    ctx.fluxer_writer.send_message = rejecting
+    ctx.fluxer_writer.last_rejection = "413, message='Attempt to decode JSON with unexpected mimetype: text/html'"
+    msg = _msg(55)
+    msg.content, msg.attachments, msg.stickers, msg.embeds = "hello", [], [], []
+    msg.mentions = msg.role_mentions = msg.channel_mentions = []
+    msg.flags, msg.reference = types.SimpleNamespace(forwarded=False), None
+    stats = {"messages": 0, "attachments": 0}
+    out = await mm._process_and_send_message(ctx, msg, "T", stats)
+    assert out == "marker-1" and len(sent) == 1
+    assert ctx.state.skipped == [("55", "Alice", 1)] and stats["skipped"] == 1
+    assert ctx.state.progress == ["55"]
+    text = ctx.fluxer_writer.markers[0]
+    assert "`55`" in text and "Fluxer rejected it" in text and "skipping" in text

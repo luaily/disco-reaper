@@ -315,6 +315,10 @@ class ConfigScreen(Screen):
     #lbl_anonymize { margin-right: 2; margin-top: 0; }
     #lbl_attempts { margin-right: 2; margin-top: 1; }
     #inp_max_attempts { width: 8; }
+    #lbl_outage { margin-right: 2; margin-top: 1; }
+    #inp_max_outage { width: 8; }
+    #lbl_notify { margin-right: 2; margin-top: 1; }
+    #inp_notify_user { width: 28; }
     """
 
     BINDINGS = [("escape", "go_back", "Back")]
@@ -432,6 +436,31 @@ class ConfigScreen(Screen):
                                 tooltip="A message that keeps failing to send is retried this many times,\nthen skipped with a marker in the channel. 0 = never skip (stop instead)"
                             ),
                             id="attempts_row",
+                            classes="switch_row"
+                        )
+
+                        yield Horizontal(
+                            Label("Stop if Fluxer is down for (min):", id="lbl_outage"),
+                            Input(
+                                value=str(self.config.max_outage_minutes),
+                                id="inp_max_outage",
+                                type="integer",
+                                max_length=4,
+                                tooltip="When Fluxer stops accepting messages (503s, timeouts) the migration pauses and\nretries the same message when it answers again, never skipping it.\n0 = keep waiting as long as it takes; N = stop the run after N minutes down"
+                            ),
+                            id="outage_row",
+                            classes="switch_row"
+                        )
+
+                        yield Horizontal(
+                            Label("DM me problems (Fluxer user ID):", id="lbl_notify"),
+                            Input(
+                                value=self.config.notify_user_id or "",
+                                id="inp_notify_user",
+                                placeholder="blank = off",
+                                tooltip="The migration bot sends this Fluxer user a direct message when something needs attention\n(Fluxer down / back, skipped messages, a halted run, the final summary).\nThe user must share the community with the bot. Find your ID with Developer Mode on."
+                            ),
+                            id="notify_row",
                             classes="switch_row"
                         )
 
@@ -663,6 +692,11 @@ class ConfigScreen(Screen):
                 self.config.max_message_attempts = max(0, int(self.query_one("#inp_max_attempts", Input).value.strip()))
             except ValueError:
                 self.config.max_message_attempts = 5
+            try:
+                self.config.max_outage_minutes = max(0, int(self.query_one("#inp_max_outage", Input).value.strip()))
+            except ValueError:
+                self.config.max_outage_minutes = 0
+            self.config.notify_user_id = self.query_one("#inp_notify_user", Input).value.strip() or None
         else:
             self.config.target_platform = "none"
 

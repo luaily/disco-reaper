@@ -15,6 +15,8 @@ class AppConfig(BaseModel):
     stoat_server_id: Optional[str] = Field(default=None)
     stoat_api_url: Optional[str] = Field(default=None)
     anonymize_users: bool = Field(default=False)
+    notify_user_id: Optional[str] = Field(default=None)   # Fluxer user ID the migration bot DMs about problems/summaries
+    max_outage_minutes: int = Field(default=0)    # stop (don't skip) if Fluxer stays unavailable this long; 0 = keep waiting
     max_message_attempts: int = Field(default=5)   # tries per message before it is skipped with a marker (0 = never skip: halt instead)
     log_level: str = Field(default="INFO")
 

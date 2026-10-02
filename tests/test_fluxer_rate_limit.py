@@ -203,7 +203,9 @@ async def test_reply_with_attachment_sends_multipart_with_reference():
     w, http, wh = _webhook_writer()
     await w.send_message(channel_id="chan", author_name="Bob", content="pic", timestamp=1,
                          files=[{"filename": "a.png", "data": b"\x89PNG"}], reply_to_message_id="42")
-    req = http.requests[0]
+    # this fake instance answers the presign call with junk, so the writer falls back to the multipart form
+    assert w.presigned_uploads is False
+    req = http.requests[-1]
     assert req["multipart"] and req["json"]["message_reference"]["message_id"] == "42"
     assert req["json"]["attachments"] == [{"id": 0, "filename": "a.png"}]
 

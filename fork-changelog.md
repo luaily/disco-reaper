@@ -3,11 +3,21 @@
 Changes in this fork relative to upstream Disco Reaper (`V4-main` @ `7fd487a`, "add support for stoat custom instance").
 This release focuses on **Fluxer rate limiting** and the **Waterfall resume** bugs it exposed. Stoat sending is unchanged.
 
-Status: rate-limit fixes **merged and verified against a live Fluxer community** (see [Testing](#testing)). The timed / overnight version below is **unreleased** (verified live, not yet committed).
+Status: the rate-limit fixes were merged in PR #2. Everything under **Unreleased** is verified against a live Fluxer community (each entry lists what was run) and covered by unit tests: 132 pass, plus the 4 pre-existing `tests/test_database.py` failures noted under Testing.
 
 ---
 
-## Unreleased — Timed / overnight Waterfall
+## Unreleased — Timed / overnight Waterfall and robustness
+
+At a glance (details below, newest first):
+- **Progress DMs** at the start and at the top of every hour: sent / remaining / set speed / average real speed / ETA.
+- **DM notifications** from the migration bot (outages, skips, halts, summary), no extra bot or webhook.
+- **Start the Waterfall from any message**, checking the Fluxer *server* (not the database) so only missing messages are sent; stale skip markers are removed.
+- **Outages hold the run** (pause, probe, retry the same message, verify) instead of skipping messages.
+- **Big attachments:** 50 MiB limit handled (left out with a note), no more silent drops, no more 413s.
+- **Presigned uploads** end the 503s / `(delivery unknown)` timeouts on media-heavy messages.
+- **Retry then skip** for failures about a single message, with a marker, a record and `list_skipped.py`.
+- **Saved media links** (refreshed + de-duplicated), **native replies**, **run options** (stop time / rate cap), the **timed runner**, **monitor**, and the `File` object fix.
 
 Large servers take days at Fluxer's real rate (~1 msg/s measured; a 198k-message server ≈ 50h), so the Waterfall can now run in a nightly window and resume where it stopped. See [docs/overnight.md](docs/overnight.md).
 
@@ -20,6 +30,41 @@ Large servers take days at Fluxer's real rate (~1 msg/s measured; a 198k-message
 - **Rate cap:** `FluxerWriter.min_send_interval` (seconds between sends), enforced by `_pace()`; abortable on cancel/deadline. Exposed as `--max-rate`.
 - **`docs/overnight.md`** — usage, exit codes, cron and launchd examples.
 - **Tests:** `tests/test_timed_waterfall.py` (parsing, the TUI dialog, deadline stop between messages, send error at the deadline is a clean stop and unmarked, error before the deadline is still an error, pacing and its cancel).
+
+### Added — progress reports by DM (at the start and every hour on the hour)
+With a notify user set (see below), the bot sends a **start report** — messages to send, the set send speed (the cap, or "no cap (as fast as Fluxer allows)") and the estimated time remaining (from the cap; uncapped it assumes ~55 msgs/min and says so) — and then a report **at the top of every hour** (wall clock) with: messages sent so far (plus any already on the server / skipped), messages remaining, the set send speed, the **average real send speed** (and the last hour's), and the estimated time remaining at the average real speed. Reports keep coming while the run is paused (for example during an outage) and then say "nothing sent yet" / "unknown until messages are going out" instead of guessing. TUI (Waterfall and per-channel) and `timed_waterfall.py` (`--report-interval MIN`, default 60). Verified live with a 60 msgs/min cap and a 1-minute interval: start report, reports at 21:14 and 21:15 (44 sent/62 left, then 100 sent/6 left, ~59.8 then 57.6 msgs/min), and the final summary. 9 new tests.
+
+### Added — DM notifications from the migration bot
+Set **"DM me problems (Fluxer user ID)"** on the Configuration screen (`notify_user_id` in `reaper_config.yaml`, `--notify-user` on the timed runner) and the bot that is already running the migration sends that user a direct message when something needs attention — no new bot, webhook or token (the user just needs to share the community with the bot). Sent: Fluxer down for more than 2 minutes (once per 30 minutes) and back again, skipped messages (throttled), a halted run and unexpected per-message errors (with the last few warnings attached), and an end-of-run summary (the timed runner also sends a "started" message). Webhook tokens are always redacted. Notifications are sent in the background, throttled per kind, and a failure to deliver one (DMs closed, API down) is logged once and never affects the migration. Verified live: start + summary DMs from two runs arrived in the owner's DMs; 9 new tests.
+
+### Added — start the Waterfall from a chosen message, checking the *server* (repairs skipped messages)
+**TUI:** Waterfall → **Start from message ID**. **CLI:** `timed_waterfall.py --from-message ID`. Starting at that source message (inclusive), every message is looked up on the Fluxer channel itself — **not** in the database — and only the ones that really are missing are sent. How a migrated message is recognised: the webhook name `<name> (discord)` plus the epoch in its `-# <t:EPOCH:D>` prefix (copies are counted, so two messages from one person in the same second need two copies; replies sent through the bot by older builds are recognised too). Messages found are adopted (the mapping is repaired from the server so replies/links resolve), the bot's stale "error migrating message … skipping" marker for a message that is now there is **deleted** and its skip record cleared, and anything still missing is posted (at the end of its channel, with its original date in the prefix). Each channel is read newest-first only until well past the starting message, and an unreadable channel halts the run instead of sending blind, so it can't create duplicates. Re-running is idempotent.
+- **Progress can no longer move backwards:** per-channel/thread `last_msg_id`/`last_msg_ts` and the Waterfall cursor only move forward, so replaying from an older message can never make a later normal resume send things twice.
+- Verified live: starting at an old synthetic message found all 3 later messages already on the server (0 sent, cursor unchanged), deleted the stale marker and cleared the skip record; adding one never-sent message and starting just before it sent exactly that one; a repeat run sent nothing. 13 new tests.
+
+### Changed — an outage now HOLDS the run instead of skipping messages
+Seen live: `Server error 503 …` and `Message … failed (Send timed out after 45s (delivery unknown)); attempt 1/5 … 2/5 … 3/5`. Every failure counted against the message, so during an outage the run burned through its attempts, **skipped the message and moved on to the next one, which failed the same way** — errors stacked up and messages were skipped for no fault of their own (the API could even answer other requests while the send route was down).
+- **Two kinds of failure.** The writer now raises `ServiceUnavailable` when the *service* is struggling (503/5xx, timeouts, connection errors, rate limits or uploads that never clear). That says nothing about the message, so it **never counts and never skips**. Everything else is a failure about the message and keeps the retry-then-skip behaviour.
+- **The run holds until Fluxer answers.** On `ServiceUnavailable` the migration pauses, tells you why ("Fluxer isn't accepting messages (…). Paused for 2m10s; checking again in 1m. Message `id` is waiting, nothing is skipped."), backs off 15s → 30s → 60s → 2m → 5m (repeating), probes the API in between (`check_health`: a light GET of the channel and its webhook) and retries **the same message** when it answers.
+- **Verified before moving on.** The first message sent after an outage is read back from the channel; if Fluxer says it isn't there (404) it is sent again.
+- **Optional stop condition.** `max_outage_minutes` (Configuration screen, `reaper_config.yaml`, `--max-outage` on the timed runner; default 0 = wait as long as it takes) stops the run after that long down — still without skipping and with the message unmarked, so a resume retries it (timed runner exits 1).
+- A deliberate **Cancel no longer shows up as an error**.
+- Verified live with 56 injected 503s spanning more than ten failed attempts on one message: the run held on that message, paused/retried with notices, then carried on; **0 skipped, 0 errors, 105/105 migrated, 0 ghosts, 0 out of order**. 12 new tests. `skip after N` (default 5) now applies only to failures about the message itself.
+
+### Fixed — `413` on big attachments, and messages disappearing silently
+Seen on a long run: `Connection error: 413, message='Attempt to decode JSON with unexpected mimetype: text/html'` on `/webhooks/…`, then a run of failures and skips.
+- **Cause.** Fluxer refuses any single file over **50 MiB** (the API says so: `FILE_SIZE_TOO_LARGE … Maximum file size is 52428800`). On the multipart form the oversized body is turned away by the edge in front of the API with an HTML **413** page (the library fails to parse it as JSON and retries the same huge upload several times). Our code then logged "rejected" and returned `None`, and the migrate step carried on **without recording anything**: the message was lost silently. With the presign endpoint, a refusal for one file also switched presigned uploads off for the whole session (every later message then used the fragile multipart form).
+- **Oversized files are left out, not fatal:** files over the limit are never uploaded; the message is sent with its text and the other attachments plus `-# ⚠ not migrated, larger than Fluxer's 50 MB file limit: \`movie.mp4\` (60.0 MB)`. If the instance's limit differs, the writer learns it from the API's answer and resends. (The file is still in the local backup.) On the legacy multipart form a 413 resends the text without the files and a note.
+- **Presigned uploads only switch off when the endpoint is truly absent** (404/405/501). A refusal for one message (`400 INVALID_FORM_BODY`, permissions) only changes that message to the multipart form.
+- **No more silent drops:** when `send_message` returns `None` (permanent rejection) the message is now skipped like any other failure: the bot posts "⚠️ There was an error migrating message `id` from **author** (date) (Fluxer rejected it), skipping...", it is recorded in `skipped_messages` with the reason, and progress advances. `scripts/list_skipped.py` lists them.
+- Verified live: a message with a small file plus a 60 MB video posted with only the small file attached and the note (1.6 s), and with the writer deliberately given the wrong limit it learned 52,428,800 from Fluxer's error and did the same. 9 new tests (+1 for the rejected-message skip).
+- **Messages lost *before* this fix** (413-dropped ones were never recorded) can be found by comparing the backup with the mapping table; a reconcile/retry tool for that is the obvious next step.
+
+### Fixed — `(delivery unknown)` timeouts and 503s on media-heavy messages: attachments now use presigned uploads
+- **Cause.** fluxer.py sends files as one multipart form *through Fluxer's API servers*. Under load that returns 503s; every library retry re-sends the whole payload; its HTTP session has a fixed 5-minute total limit; and our own timer covered upload + posting together, so a slow upload ended as `Send timed out (delivery unknown)` even though nothing had been posted.
+- **Fix: `src/fluxer/uploads.py`.** Fluxer has a direct route (found in its OpenAPI spec, `https://api.fluxer.app/v1/openapi.json`): `POST /channels/{id}/attachments` returns presigned object-storage URLs (≤10 files per call; ≤10 MB = one PUT, larger = multipart parts finished by `POST /channels/{id}/attachments/complete`), and the message then only *references* the uploads (`{id, filename, content_type, upload_filename, file_size}`). Files never touch the API servers, each PUT/part is retried on its own (503/429/timeouts back off 1/2/4s; an expired URL gets a fresh presign), and the message POST is a few hundred bytes of JSON. The writer uploads first, then posts, so a failed upload cannot have delivered anything and a retried POST never re-sends the files.
+- **Safe fallbacks.** An instance without the endpoint (or an unexpected answer) switches to the old multipart form for the session; a message rejected (4xx) with presigned attachments is retried once with the multipart form. Replies, avatars/usernames, skip-after-N, the delivery check and rate-limit handling are unchanged.
+- Verified live: one message carrying **10 files × 3 MB (30 MB)** posted in 20.6 s, and a **reply carrying a 12 MB file (multipart plan)** in 8.4 s, attachments intact, native reply as the webhook identity. 16 new tests (fake API + fake storage). Not reproduced live: the 503 itself (it needs heavy load, and flooding from the same IP could trip the abuse block).
 
 ### Added — retry then skip messages that keep failing (and stop timing out large uploads)
 A message that kept failing (live: `Halted at message …: Send timed out after 45s (delivery unknown)`) used to halt the whole run every time.
@@ -123,7 +168,9 @@ Unit tests: 5/5 new tests pass; suite is 27 passed / 4 failed. The 4 failures ar
 
 ## Known limitations
 
-- **Send timeout with no rate limit active:** delivery is unknown; the run halts and a resume may post one duplicate.
+- **Send timeout with no rate limit active:** delivery is unknown. The writer now looks for the message in the channel before anyone retries (exact webhook name + body within the last few minutes), so a duplicate is unlikely but not impossible.
+- **Repaired / re-sent messages land at the end of their channel** (with their original date in the prefix), not in their original position.
+- **Stoat** has none of the Fluxer-only features above (presigned uploads, outage hold, skip-and-marker, DM notifications, start-from-message).
 - **Webhook resolution failure** falls back to the bot-post path (author shown as a `-# · name` prefix rather than the webhook identity). It is not retried.
 - **`send_marker` (thread start/end markers)** still returns `None` on failure and is not retried.
 - **Stoat** sending is untouched: it still logs-and-skips failures and does not update the Waterfall cursor (resume falls back to the per-channel minimum).
@@ -141,4 +188,11 @@ Unit tests: 5/5 new tests pass; suite is 27 passed / 4 failed. The 4 failures ar
 | `src/core/base.py` | wires `writer.stop_check` |
 | `src/fluxer/clone_server.py`, `roles_permissions.py`, `emoji_stickers.py` | int/str ID comparison fixes |
 | `src/ui/shuttle_ops.py` | cursor-first resume point, rate-limit notices, halt reporting |
-| `tests/test_fluxer_rate_limit.py`, `scripts/live_waterfall.py`, `livetest.toml`, `SourceDirectory.md`, `.gitignore` | new / updated |
+| `src/fluxer/uploads.py` *(new)* | presigned attachment uploads (singlepart / multipart), per-file limit handling |
+| `src/fluxer/server_index.py` *(new)* | reads what is on the Fluxer server (migrated copies + skip markers) for start-from-message |
+| `src/core/notify.py` *(new)* | DM notifications and the hourly `ProgressReporter` |
+| `src/core/media_links.py` *(new)* | saves + de-duplicates media pasted as links |
+| `src/core/utils.py`, `configuration.py`, `database.py`, `exporter.py`, `backup_database.py`, `src/ui/modals.py`, `main_app.py` | run options dialog, settings (attempts, outage, notify user), skipped-message tables, forward-only progress, link table |
+| `scripts/timed_waterfall.py`, `monitor_run.py`, `resolve_media_links.py`, `list_skipped.py`, `live_waterfall.py` *(new)* | overnight runner, observer, media-link updater, skipped-message list, live test harness |
+| `tests/test_fluxer_rate_limit.py`, `test_timed_waterfall.py`, `test_media_links.py`, `test_skip_messages.py`, `test_uploads.py`, `test_outage.py`, `test_notify.py`, `test_verify_from.py`, `test_progress_report.py` | new / updated |
+| `docs/overnight.md`, `SourceDirectory.md`, `fork-changelog.md`, `.gitignore` | docs |
