@@ -120,6 +120,9 @@ class FluxerNotifier:
                 self._failures = 0
                 self.sent.append(body)
             except Exception as e:
+                repair = getattr(self.writer, "repair_rate_limiter", None)
+                if repair is not None:
+                    repair()                          # a timed-out (cancelled) DM must not leave the HTTP client's lock held
                 self._failures += 1
                 self._dm = None if self._failures > 1 else self._dm
                 if self._failures in (1, 5, 20):

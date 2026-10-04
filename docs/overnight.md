@@ -122,6 +122,13 @@ first message after the outage is read back from the channel to confirm it arriv
 on the Configuration screen, `max_outage_minutes` in `reaper_config.yaml`, or `--max-outage N` on `timed_waterfall.py`
 (it then exits with code 1, still without skipping anything).
 
+### One bad message can't stall the run
+If a single message keeps failing while Fluxer otherwise looks healthy (suspected cause: some links or embeds), the run does
+not wait on it forever: it retries it without embeds and with link previews suppressed, then with its links shown as plain
+code, and finally sends a tiny test message to check that sending works at all. If that works the message is skipped with
+the usual marker; if it does not, it is treated as an outage and the run keeps holding. The log and the DM say what was risky
+about the message (link hosts, embeds, length).
+
 ## Messages that keep failing
 A send that fails for a reason about *that message* is retried, and after **5 attempts** the message is
 skipped: the bot posts a marker in the channel ("There was an error migrating message `id` … skipping...") and the run

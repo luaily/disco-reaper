@@ -87,9 +87,19 @@ INJECT_PLAN = {
 }
 
 
+# Content-based faults: Fluxer fails (503) for ONE specific message while everything else works.
+#   poison         every send of a message containing "poisonlink" fails
+#   poison_unfurl  fails only while Fluxer would have to unfurl links (flags without SUPPRESS_EMBEDS = 4)
+POISON = {
+    "poison": lambda body: "poisonlink" in (body.get("content") or ""),
+    "poison_unfurl": lambda body: "poisonlink" in (body.get("content") or "") and not (int(body.get("flags") or 0) & 4),
+}
+
+
 def install_injection(names):
     import aiohttp
-    windows = [tuple(w) + (429,) if len(w) == 4 else tuple(w) for n in names for w in INJECT_PLAN[n]]
+    windows = [tuple(w) + (429,) if len(w) == 4 else tuple(w) for n in names if n in INJECT_PLAN for w in INJECT_PLAN[n]]
+    poison = [POISON[n] for n in names if n in POISON]
     calls = {"n": 0}
     orig = aiohttp.ClientSession.request
 
@@ -115,6 +125,10 @@ def install_injection(names):
     def patched(self, method, url, **kw):
         u = str(url)
         if method.upper() == "POST" and ("/webhooks/" in u or u.endswith("/messages")):
+            body = kw.get("json")
+            if poison and isinstance(body, dict) and any(p(body) for p in poison):
+                print(f"  [inject] poisoned message: HTTP 503 (flags={body.get('flags')}, embeds={len(body.get('embeds') or [])})", flush=True)
+                return _Ctx({"code": "UNAVAILABLE"}, 503)
             calls["n"] += 1
             for lo, hi, secs, glob, status in windows:
                 if lo <= calls["n"] <= hi:
@@ -133,7 +147,7 @@ async def cmd_run(cfg, args):
         install_injection(names)
         if "halt" in names:
             wr._MAX_RECOVERY_ROUNDS = 2   # give up quickly instead of after ~5 minutes
-        if "outage" in names:
+        if "outage" in names or any(n in POISON for n in names):
             wr._MAX_RECOVERY_ROUNDS = 1   # one pass per attempt, so a 56-call outage spans many attempts
             mm.OUTAGE_BACKOFF = (3, 4)    # short pauses so the demonstration doesn't take hours
         print(f"fault injection ON: {names}")
@@ -168,7 +182,7 @@ async def cmd_run(cfg, args):
                 ctx.is_running = False   # simulate the user pressing Cancel
 
         res = await mm.migrate_global_messages(ctx, after_message_id=after_id, progress_callback=progress)
-        print(json.dumps({k: res[k] for k in ("messages", "threads", "attachments")} | {"error": res.get("error"), "skipped": res.get("skipped", 0)}))
+        print(json.dumps({k: res[k] for k in ("messages", "threads", "attachments")} | {"error": res.get("error"), "skipped": res.get("skipped", 0), "degraded": res.get("degraded", 0)}))
         print("final cursor:", ctx.state.get_waterfall_cursor())
     finally:
         ctx.is_running = False

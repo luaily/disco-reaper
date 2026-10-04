@@ -182,11 +182,15 @@ async def _process_and_send_message(
     thread_id: str | None = None,
     parent_target_id: str | None = None,
     thread_name: str | None = None,
-    processed_threads: set | None = None
+    processed_threads: set | None = None,
+    degrade: int = 0
 ) -> str | None:
     """
     Internal helper to process a single Discord message (mentions, attachments, stickers)
     and send it to the Fluxer platform.
+
+    degrade (set by _process_with_retries for a message that keeps failing while Fluxer looks healthy):
+    1 = no custom embeds and link unfurling suppressed; 2 = additionally every link is shown as plain code text.
     """
     # 1. Formatting
     content = msg.content or ""
@@ -350,6 +354,9 @@ async def _process_and_send_message(
             send_content, send_files, send_embeds, link_files = content, list(files), msg.embeds, []
 
     def _send(c, f, em):
+        if degrade >= 2:
+            c = defang_links(c)
+        extra = {"suppress_embeds": True} if degrade >= 1 else {}
         return context.fluxer_writer.send_message(
             channel_id=target_channel_id,
             author_name=author_name,
@@ -359,7 +366,8 @@ async def _process_and_send_message(
             files=f if f else None,
             reply_to_message_id=reply_to_fluxer_id,
             is_forwarded=is_forwarded,
-            embeds=em
+            embeds=None if degrade >= 1 else em,
+            **extra
         )
 
     fluxer_msg_id = await _send(send_content, send_files, send_embeds)
@@ -482,6 +490,28 @@ async def _adopt_existing(context: MigrationContext, index: Any, msg: Any, targe
     stats["already_on_server"] = stats.get("already_on_server", 0) + 1
 
 
+URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'`]+", re.IGNORECASE)
+SUSPECT_LIMIT = 2          # consecutive failures with a healthy-looking API before a message is treated as suspect
+
+
+def defang_links(text: str) -> str:
+    """Shows every link as plain code text (`https://...`) so Fluxer never fetches or unfurls it."""
+    return URL_RE.sub(lambda m: f"`{m.group(0)}`", text) if text else text
+
+
+def message_link_info(msg: Any) -> str:
+    """One line describing what is risky about a message that keeps failing: its link hosts and embeds."""
+    from urllib.parse import urlparse
+    content = getattr(msg, "content", None) or ""
+    urls = list(URL_RE.findall(content))
+    for e in (getattr(msg, "embeds", None) or []):
+        d = e.to_dict() if hasattr(e, "to_dict") else (e if isinstance(e, dict) else {})
+        urls += [d.get("url")] + [(d.get(k) or {}).get("url") for k in ("thumbnail", "image")]
+    hosts = sorted({(urlparse(u).hostname or "") for u in urls if u} - {""})
+    return (f"links: {', '.join(hosts[:6]) or 'none'}; embeds: {len(getattr(msg, 'embeds', None) or [])}; "
+            f"text length: {len(content)}; attachments: {len(getattr(msg, 'attachments', None) or [])}")
+
+
 OUTAGE_BACKOFF = (15, 30, 60, 120, 300)   # seconds between health checks while Fluxer is down; the last value repeats
 
 
@@ -500,16 +530,19 @@ async def _sleep_checked(context: MigrationContext, seconds: float) -> bool:
 
 
 async def _wait_for_service(context: MigrationContext, target_channel_id: str, msg: Any, error: Exception,
-                            outage_started: float, step: int) -> int:
+                            outage_started: float, step: int) -> tuple:
     """Holds the run (nothing is retried, counted or skipped) until Fluxer answers again.
 
-    Backs off 15s, 30s, 60s, 2m, 5m... and probes the API between waits. Returns the backoff step to continue from.
+    Backs off 15s, 30s, 60s, 2m, 5m... and probes the API between waits. Returns (backoff step to continue from,
+    number of probes that found the API unhealthy). 0 unhealthy probes means the API looked fine straight away, so the
+    failure may be about this particular message rather than an outage.
     Raises MessageSendError if the run is cancelled / hits its stop time, or if config.max_outage_minutes (0 = keep
     waiting forever) is exceeded; in every case the message stays unmarked, so a resume retries it."""
     notice = getattr(context, "on_notice", None)
     max_minutes = int(getattr(getattr(context, "config", None), "max_outage_minutes", 0) or 0)
     detail = str(error)
     dm_sent = False
+    unhealthy = 0
     while True:
         delay = OUTAGE_BACKOFF[min(step, len(OUTAGE_BACKOFF) - 1)]
         step += 1
@@ -530,38 +563,49 @@ async def _wait_for_service(context: MigrationContext, target_channel_id: str, m
             raise MessageSendError(f"Fluxer has been unavailable for over {max_minutes} minutes ({detail}); stopping so "
                                    f"nothing is skipped. Message {msg.id} was not migrated.")
         healthy, detail = await context.fluxer_writer.check_health(target_channel_id)
+        if not healthy:
+            unhealthy += 1
         if healthy:
+            repair = getattr(context.fluxer_writer, "repair_rate_limiter", None)
+            if repair is not None:
+                repair()          # the API answers: a send that still hangs is more likely a stuck local lock than an outage
             logger.info(f"Fluxer answers again after {_fmt_secs(time.time() - outage_started)}; retrying message {msg.id}")
             if notice:
                 notice(f"[green]Fluxer is answering again. Retrying message {msg.id}...[/green]")
             if dm_sent and hasattr(context, "notify"):
                 context.notify(f"Fluxer is answering again after {_fmt_secs(time.time() - outage_started)}; "
                                f"the migration is resuming at message `{msg.id}`.", kind="ok", key="recovered", cooldown=600)
-            return step
+            return step, unhealthy
 
 
 async def _process_with_retries(context: MigrationContext, msg: Any, target_channel_id: str, stats: Dict[str, Any],
                                 **kwargs) -> str | None:
-    """_process_and_send_message with two different answers to failure.
+    """_process_and_send_message with three answers to failure.
 
     * The SERVICE is struggling (503/5xx, timeouts, connection errors, uploads or rate limits that never clear):
-      this says nothing about the message. The run HOLDS, backing off and probing Fluxer, then retries the same
-      message. Nothing is counted against the message and nothing is skipped. The first message sent after an
-      outage is read back from the channel to confirm it really exists. `max_outage_minutes` (default 0 = wait
-      as long as it takes) stops the run, still without skipping, if the outage lasts too long.
-    * A failure that is about the MESSAGE (anything else raised as MessageSendError) is counted per message in the
-      migration DB (survives restarts) against `max_message_attempts` (default 5; 0 = never skip) and then skipped
-      with a marker.
+      the run HOLDS, backing off and probing Fluxer, then retries the same message. Nothing is counted against the
+      message and nothing is skipped. The first message sent after an outage is read back from the channel.
+      `max_outage_minutes` (0 = wait as long as it takes) stops the run, still without skipping.
+    * ONE MESSAGE seems to be the problem: it failed and the API looked healthy straight away, twice in a row. It is
+      retried without custom embeds and with link unfurling suppressed, then with its links shown as plain code. If it
+      still fails, a tiny canary message is sent the same way: if the canary goes through, Fluxer is fine and this
+      message is the problem, so it is skipped with a marker (the run carries on); if the canary fails it is an outage
+      after all and the run keeps holding.
+    * Any other `MessageSendError` (about the message) is counted per message in the migration DB against
+      `max_message_attempts` (default 5; 0 = never skip) and then skipped with a marker.
     A cancel or the scheduled stop time is never counted."""
     max_attempts = int(getattr(getattr(context, "config", None), "max_message_attempts", 5) or 0)
     notice = getattr(context, "on_notice", None)
     failed_here = False
     outage_started: float | None = None
     outage_step = 0
+    degrade = 0
+    suspect = 0
+    risky = bool(URL_RE.search(getattr(msg, "content", None) or "")) or bool(getattr(msg, "embeds", None))
     while True:
         try:
             result = await _process_and_send_message(context=context, msg=msg, target_channel_id=target_channel_id,
-                                                     stats=stats, **kwargs)
+                                                     stats=stats, degrade=degrade, **kwargs)
             if outage_started is not None and result:
                 # first message after an outage: make sure it is really there before moving on
                 if await context.fluxer_writer.verify_message(target_channel_id, result) is False:
@@ -569,6 +613,9 @@ async def _process_with_retries(context: MigrationContext, msg: Any, target_chan
                     stats["messages"] = max(0, stats.get("messages", 0) - 1)
                     continue
                 outage_started, outage_step = None, 0
+            if degrade:
+                stats["degraded"] = stats.get("degraded", 0) + 1
+                stats.setdefault("degraded_ids", []).append(str(msg.id))
             if failed_here:
                 context.state.clear_message_attempts(msg.id)
             return result
@@ -577,7 +624,31 @@ async def _process_with_retries(context: MigrationContext, msg: Any, target_chan
                 raise
             if outage_started is None:
                 outage_started = time.time()
-            outage_step = await _wait_for_service(context, target_channel_id, msg, e, outage_started, outage_step)
+            info = message_link_info(msg)
+            logger.warning(f"Message {msg.id} failed to send ({e}); {info}")
+            outage_step, unhealthy = await _wait_for_service(context, target_channel_id, msg, e, outage_started, outage_step)
+            suspect = 0 if unhealthy else suspect + 1          # an unhealthy probe means a real outage, not this message
+            if suspect < SUSPECT_LIMIT:
+                continue
+            suspect = 0
+            if risky and degrade < 2:
+                degrade += 1
+                what = "without embeds and with link previews suppressed" if degrade == 1 else "with its links shown as plain code"
+                logger.warning(f"Message {msg.id} keeps failing while Fluxer looks healthy ({info}); retrying {what}")
+                if notice:
+                    notice(f"[yellow]Message {msg.id} keeps failing while Fluxer looks healthy ({info}). Retrying {what}...[/yellow]")
+                if hasattr(context, "notify"):
+                    context.notify(f"Message `{msg.id}` keeps failing while Fluxer looks healthy ({info}). Retrying {what}.",
+                                   kind="warn", key="degrade", cooldown=600)
+                continue
+            canary = getattr(context.fluxer_writer, "canary", None)
+            if canary is not None and await canary(target_channel_id):
+                return await _skip_message(
+                    context, msg, target_channel_id,
+                    f"Fluxer keeps failing on this message ({e}) although other messages send fine; also tried "
+                    f"{'without embeds/links' if risky else 'again'} ({info})", SUSPECT_LIMIT * (3 if risky else 1), stats,
+                    kwargs.get("thread_id"))
+            # the canary failed too (or can't be sent): it is an outage after all, keep holding
         except MessageSendError as e:
             if max_attempts <= 0 or not context.is_running or context.deadline_reached():
                 raise

@@ -66,6 +66,8 @@ def _writer(recent):
 @pytest.mark.asyncio
 async def test_timed_out_send_that_actually_landed_is_not_retried(monkeypatch):
     monkeypatch.setattr(wm, "_SEND_TIMEOUT", 0.05)
+    monkeypatch.setattr(wm, "_STALL_GRACE", 0.1)
+    monkeypatch.setattr(wm, "_STALL_POLL", 0.05)
     body = "-# <t:100:D>\nhello"
     w = _writer([{"id": "999", "content": body, "author": {"username": "Bob (discord)"}},
                  {"id": "998", "content": "other", "author": {"username": "Bob (discord)"}}])
@@ -76,6 +78,8 @@ async def test_timed_out_send_that_actually_landed_is_not_retried(monkeypatch):
 @pytest.mark.asyncio
 async def test_timed_out_send_not_found_still_raises(monkeypatch):
     monkeypatch.setattr(wm, "_SEND_TIMEOUT", 0.05)
+    monkeypatch.setattr(wm, "_STALL_GRACE", 0.1)
+    monkeypatch.setattr(wm, "_STALL_POLL", 0.05)
     w = _writer([{"id": "1", "content": "-# <t:100:D>\nhello", "author": {"username": "SomeoneElse (discord)"}}])
     with pytest.raises(SendTimeout):
         await w.send_message(channel_id="chan", author_name="Bob", content="hello", timestamp=100)

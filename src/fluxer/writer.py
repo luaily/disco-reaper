@@ -28,6 +28,8 @@ def _redact(text) -> str:
 _ASSUMED_UPLOAD_BPS = 100_000      # assume at least ~100 KB/s up so big attachments aren't timed out too early
 _DELIVERY_LOOKBACK_S = 180         # how far back to look for a message whose send "timed out"
 _UPLOAD_ROUNDS = 3                # pause-and-retry rounds for a transient upload failure (5s, 10s, 20s)
+_STALL_GRACE = 75.0               # after a send has gone quiet for the timeout, how much longer to keep waiting for it
+_STALL_POLL = 25.0                # ...checking the channel for the message this often
 
 
 def _upload_timeout(files) -> float:
@@ -325,7 +327,8 @@ class FluxerWriter:
         self._channels_cache = await self.client.get_guild_channels(self.community_id)
         return self._channels_cache
 
-    async def send_message(self, channel_id: str, author_name: str, content: str, timestamp: int, author_avatar_url: Optional[str] = None, files: Optional[List[Dict[str, Any]]] = None, reply_to_message_id: Optional[str] = None, is_forwarded: bool = False, embeds: Optional[List[Dict[str, Any]]] = None, _limit_retry: bool = False) -> Optional[str]:
+    async def send_message(self, channel_id: str, author_name: str, content: str, timestamp: int, author_avatar_url: Optional[str] = None, files: Optional[List[Dict[str, Any]]] = None, reply_to_message_id: Optional[str] = None, is_forwarded: bool = False, embeds: Optional[List[Dict[str, Any]]] = None, _limit_retry: bool = False,
+                           suppress_embeds: bool = False) -> Optional[str]:
         """
         Sends a message to the target channel.
         Uses a webhook to mimic the original author if possible.
@@ -333,6 +336,8 @@ class FluxerWriter:
         """
         assert self.client is not None
         self.last_rejection = None
+        if suppress_embeds:
+            embeds = None            # degraded send: no custom embeds, and Fluxer is told not to unfurl links (flags=4)
         # Files over Fluxer's per-file limit can never be uploaded: leave them out and say so in the message.
         if files:
             too_big = [f for f in files if len(f["data"]) > self.max_file_bytes]
@@ -414,7 +419,8 @@ class FluxerWriter:
                     logger.warning(f"Fluxer: per-file limit is {e.limit} bytes; leaving larger files out of messages")
                     self.max_file_bytes = e.limit
                     return await self.send_message(channel_id, author_name, content, timestamp, author_avatar_url, files,
-                                                   reply_to_message_id, is_forwarded, embeds, _limit_retry=True)
+                                                   reply_to_message_id, is_forwarded, embeds, _limit_retry=True,
+                                                   suppress_embeds=suppress_embeds)
                 self.last_rejection = f"a file exceeds Fluxer's per-file limit ({e.limit or 'unknown'} bytes)"
                 logger.error(f"Fluxer rejected message for channel {channel_id}: {self.last_rejection}")
                 return None
@@ -431,12 +437,13 @@ class FluxerWriter:
                 body = final_content
                 if reply_to_message_id and not ref:      # reference was rejected: keep a visible trace of the reply
                     body = "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content
-                if (ref or use_uploaded) and hasattr(self.client, "_route"):
+                if (ref or use_uploaded or suppress_embeds) and hasattr(self.client, "_route"):
                     logger.debug(f"Fluxer: Sending {'reply' if ref else 'message'} via webhook {webhook.id} for user '{author_name}'")
                     return await self._webhook_execute(
                         webhook, content=body, username=username, avatar_url=author_avatar_url,
                         embeds=normalized_embeds, message_reference=ref,
-                        attachments=uploaded if use_uploaded else None, files=None if use_uploaded else files)
+                        attachments=uploaded if use_uploaded else None, files=None if use_uploaded else files,
+                        flags=4 if suppress_embeds else None)
                 logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}'")
                 msg = await webhook.send(
                     content=body,
@@ -475,12 +482,24 @@ class FluxerWriter:
             return str(msg_data["id"]) if msg_data else None
 
         started = time.time()
+
+        async def _rescue() -> Optional[str]:
+            """Was the message delivered even though no answer came back?"""
+            if not webhook:
+                return None
+            found = await self._find_delivered(
+                channel_id, started, f"{author_name} (discord)",
+                {final_content, "-# ↳ *(in reply to a message that could not be linked)*\n" + final_content})
+            if found:
+                logger.warning(f"Fluxer: no answer for the send to {channel_id}, but the message is there ({found}); not resending")
+            return found
+
         try:
             while True:
                 # Uploaded files make the POST tiny, so it gets the normal timeout; otherwise it carries the payload.
                 send_timeout = _SEND_TIMEOUT if use_uploaded else _upload_timeout(files)
                 try:
-                    return await self._send_with_recovery(_attempt, channel_id, send_timeout)
+                    return await self._send_with_recovery(_attempt, channel_id, send_timeout, _rescue)
                 except SendTimeout:
                     # The request may have gone through even though we never saw the answer. Look for it before
                     # anyone retries, otherwise a retry would post a duplicate.
@@ -570,6 +589,25 @@ class FluxerWriter:
                     waited += 1.0
         raise ServiceUnavailable(f"Upload to Fluxer storage failed after {_UPLOAD_ROUNDS} rounds: {_redact(last)}")
 
+    async def canary(self, channel_id: str, timeout: float = 30.0) -> bool:
+        """Is the SEND route working for an ordinary message right now? Posts a tiny plain-text message through the same
+        webhook route real messages use, then deletes it. Used to tell "this one message is the problem" (the canary
+        goes through) from "Fluxer is struggling" (it doesn't) after a message keeps failing. False on any failure."""
+        try:
+            webhook = await self._get_or_create_webhook(str(channel_id))
+            if webhook is None or not hasattr(self.client, "_route"):
+                return False
+            mid = await asyncio.wait_for(
+                self._webhook_execute(webhook, content="·", username="Reaper check (discord)", avatar_url=None, embeds=None),
+                timeout)
+            if mid:
+                await self.delete_message(str(channel_id), mid)
+            return bool(mid)
+        except Exception as e:
+            logger.info(f"Fluxer: canary message failed ({type(e).__name__}: {_redact(e)})")
+            self.repair_rate_limiter()          # wait_for cancelled the request: free the lock it may have leaked
+            return False
+
     def bot_username(self) -> Optional[str]:
         """The migration bot's own username (to recognise its messages), if known."""
         try:
@@ -634,7 +672,7 @@ class FluxerWriter:
         return None
 
     async def _webhook_execute(self, webhook, *, content, username, avatar_url, embeds, message_reference=None,
-                               attachments=None, files=None) -> Optional[str]:
+                               attachments=None, files=None, flags=None) -> Optional[str]:
         """POST /webhooks/{id}/{token} directly (fluxer.py's Webhook.send can't carry a reply reference or presigned
         attachments). `attachments` = descriptors from PresignedUploader (plain JSON); `files` = legacy multipart."""
         import aiohttp
@@ -642,6 +680,8 @@ class FluxerWriter:
         payload: Dict[str, Any] = {"content": content, "username": username}
         if message_reference:
             payload["message_reference"] = message_reference
+        if flags:
+            payload["flags"] = flags          # 4 = SUPPRESS_EMBEDS: Fluxer won't unfurl links in this message
         if avatar_url:
             payload["avatar_url"] = avatar_url
         if embeds:
@@ -691,33 +731,69 @@ class FluxerWriter:
     def _cancelled(self) -> bool:
         return bool(self.stop_check and self.stop_check())
 
-    async def _await_with_ratelimit(self, coro, timeout: float = _SEND_TIMEOUT) -> Any:
+    def repair_rate_limiter(self) -> int:
+        """Releases rate-limit locks left locked by a cancelled request. -> how many were released.
+
+        fluxer.py's HTTP client takes a per-route lock before each request and only releases it when a response
+        arrives (or an ordinary network error is caught). If a request is CANCELLED mid-flight (our own timeout, the
+        user pressing Cancel) the lock is never released, and because the webhook route's lock key does not include
+        the webhook, every later webhook send then waits forever on a lock nobody holds, while the API itself is
+        perfectly healthy (it looked exactly like an outage that never ended). Sends here are serial, so any lock still
+        held while no request of ours is in flight is a leak."""
+        limiter = getattr(self.client, "_rate_limiter", None) if self.bot else None
+        released = 0
+        for lock in list(getattr(limiter, "_locks", {}).values()):
+            if lock.locked():
+                lock.release()
+                released += 1
+        if released:
+            logger.warning(f"Fluxer: released {released} stuck rate-limit lock(s) left by a cancelled request")
+        return released
+
+    async def _await_with_ratelimit(self, coro, timeout: float = _SEND_TIMEOUT, rescue=None) -> Any:
         """Awaits a send, but only enforces the timeout while we are NOT waiting on a rate limit.
-        (A plain wait_for would cancel a request that is merely sleeping through a 429 pause.)"""
+        (A plain wait_for would cancel a request that is merely sleeping through a 429 pause.)
+
+        When the request goes quiet for `timeout` it may still have been delivered (a slow answer), so before giving
+        up it is given a grace period during which `rescue()` (look for the message in the channel) is tried every
+        _STALL_POLL seconds and the request is allowed to finish on its own. Only then is it cancelled, and a
+        cancelled request always gets its leaked rate-limit lock released (see repair_rate_limiter)."""
         task = asyncio.ensure_future(coro)
         try:
-            while True:
-                done, _ = await asyncio.wait({task}, timeout=timeout)
-                if done:
-                    return task.result()
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            grace_left = _STALL_GRACE
+            while not done:
                 if self._cancelled():
                     raise MessageSendError("Cancelled while sending")
                 if self._rate_limit_remaining() > 0:
-                    continue  # paused by the rate limiter, keep waiting
-                raise SendTimeout(f"Send timed out after {timeout:.0f}s (delivery unknown)")
+                    done, _ = await asyncio.wait({task}, timeout=timeout)        # paused by the rate limiter, keep waiting
+                    continue
+                if rescue is not None:
+                    found = await rescue()
+                    if found:
+                        return found
+                if grace_left <= 0:
+                    raise SendTimeout(f"Send timed out after {timeout + _STALL_GRACE:.0f}s (delivery unknown)")
+                step = min(_STALL_POLL, grace_left)
+                grace_left -= step
+                done, _ = await asyncio.wait({task}, timeout=step)
+            return task.result()
         finally:
             if not task.done():
                 task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self.repair_rate_limiter()
 
-    async def _send_with_recovery(self, attempt_fn, channel_id: str, timeout: float = _SEND_TIMEOUT) -> str:
+    async def _send_with_recovery(self, attempt_fn, channel_id: str, timeout: float = _SEND_TIMEOUT, rescue=None) -> str:
         """Runs a send. Rate limits/outages the HTTP client can't ride out are waited out here and the
         SAME message is retried. Returns the new message id, or raises MessageSendError.
         Permanent API rejections propagate as their original exception."""
         for round_ in range(_MAX_RECOVERY_ROUNDS):
             if self._cancelled():
                 raise MessageSendError("Cancelled")
+            self.repair_rate_limiter()          # nothing of ours is in flight here: any held lock is a leak
             try:
-                msg_id = await self._await_with_ratelimit(attempt_fn(), timeout)
+                msg_id = await self._await_with_ratelimit(attempt_fn(), timeout, rescue)
                 if msg_id:
                     return msg_id
                 raise MessageSendError(f"Fluxer returned no message id for channel {channel_id}")
