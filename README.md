@@ -1,19 +1,50 @@
-# DiscoReaper
+# DiscoReaper (Luaily's Spinoff Version for Fluxer)
 
 ## EDITED IN THIS FORK VERSION:
 Edited by [@luaily](https://github.com/luaily)  
-This fork creates a heavily tested fix for the `429/rate-limit` error on Fluxer that should gracefully handle rate limits and will freeze the waterfall transfer until rate-limit bucket opens back up, 
+This fork creates a heavily tested fixed and changed spinoff version based on [rambros3d/disco-reaper](https://github.com/rambros3d/disco-reaper) which adds QoL features, fixes bugs previously present in code, and creates a larger backup scope.
 
-FIXES/CHANGES:
+### TEST STATISTICS: 
+| DATE | MESSAGES MIGRATED | TIME TO FINISH | SCOPE |
+| :--- | :---: | :---: |  :---: |
+| 2026 SEP 28 | `396` MESSAGES | `4min 31sec` (MR) | MESSAGES & IMAGES |
+| 2026 OCT 01 | `89,258` MESSAGES | `26hr 52min` (SR) | ALL POSSIBLE MESSAGES |
+
+_**MR** = Multi Run | **SR** = Single Run_ | Disclaimer: All fixes & tests apply only to Fluxer. 
+
+
+### CHANGELOG:  
+BASED ON [rambros3d/disco-reaper](https://github.com/rambros3d/disco-reaper):V4-main commit:[`2d33b16`](https://github.com/rambros3d/disco-reaper/commit/2d33b16d2c09098a3a1648dc15fc8abaee92b977), this repository will likely not update the source past this version.
+
+* Added an AGPLv3 license.
+  * The original code states "Take it, use it, modify it, feel free to do whatever you wish.", therefore, I will do whatever I wish and license it with the restriction that all iterations from this point—using this repository's versions past V4-Main original fork point commit:`e9450ed`—onwards MUST also contribute their modifications back to the public. 
+  * If the original author has a problem with this I will said license.
+
+#### IMPORTED FROM BRANCH: `ratelimit-fix` (COMMIT: `e9450ed`).  
 1. FIXED: Messages marked as migrated when they were never delivered (Fluxer)
 2. FIXED: Rate limits were not waited out
 3. FIXED: Resume restarted from the top / duplicated channels
 4. FIXED: Waterfall pre-scan counted already-migrated messages
 
-TEST STATISTICS: 
-| DATE | MESSAGES SENT | HIGHEST RATE-LIMIT TIME ENCOUNTERED |
-| :--- | :---: | :---: |
-| 2026 SEP 28 | 396 MESSAGES |  0.7s | 
+#### IMPORTED FROM BRANCH: `QoL-Features-Fluxer` (COMMIT: `d0a5c8d`). 
+5. ADDED TUI run options
+6. ADDED a monitor (for extensive testing purposes)
+7. ADDED deadline runs (runs until HH:MM or for x hours)
+8. ADDED media.discord.com resolver
+9. ADDED auto-backup for media.discord.com links
+10. CHANGED the way replies are handled to keep the user’s identity
+11. FIXED `'File' object is not subscriptable` bug that would halt all migration.
+12. FIXED a bug where messages would be skipped or disco-reaper would lose track of if it has been migrated, (error: `(delivery unknown) The message was NOT marked as migrated`). 
+13. FIXED a bug where large media attachments would not send if they took longer than 45s to upload (45s to upload + 1s for every 100KB of size to max 900s)
+14. ADDED a feature, where, in the event of a error, it will re-attempt to send the message 5 times and log messages to migration and to logs when it cannot migrate a message.
+15. FIXED `delivery unknown` timeouts and 503s on media-heavy messages
+16. FIXED `HTTP ERROR 413` on large attachments and messages vanishing
+17. CHANGED `HTTP ERROR 503` will now hold the migration instad of sending messages into the void and skipping them.
+18. ADDED the option to start waterfall migration from a certain message, will auto-check any unsent messages after that discord message id and send them
+19. ADDED DM notifs from the migration bot
+20. ADDED DM progress reports at the start of every hour on the hour, to the already set fluxer id.
+21. FIX leak-lock, when cancelled mid-upload, a message will hold the waterfall migration indefinitely. (FLUXER, BUG ON CHANGED CODE FOR PREVIOUS [COMMIT](499fed1)) 
+22. TRANSPARANCY FIX on poisioned messages, random errors may cause issues which, tied with the previous bug, would lock the program in an indefinite loop of failing to send messages. (FLUXER)
 
 SEE [CHANGELOG](./fork-changelog.md)
 
@@ -188,14 +219,5 @@ But now their own website states that **Persona** will be used in some countries
 - Code is provided as is; This tool was developed with AI.
 - Take it, use it, modify it, feel free to do whatever you wish.
 
----
-
-## Contributors
-
-<a href="https://github.com/rambros3d/disco-reaper/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=rambros3d/disco-reaper" />
-</a>
-
-Made with [contrib.rocks](https://contrib.rocks).
 
 [![Star History Chart](https://api.star-history.com/image?repos=rambros3d/disco-reaper&type=date&legend=top-left)](https://www.star-history.com/?repos=rambros3d%2Fdisco-reaper&type=date&legend=top-left)
