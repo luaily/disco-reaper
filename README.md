@@ -1,5 +1,5 @@
 # DiscoReaper (Luaily's Spinoff Version for Fluxer)
-
+- [Ask DeepWiki](https://deepwiki.com/luaily/disco-reaper)
 ## EDITED IN THIS FORK VERSION:
 Edited by [@luaily](https://github.com/luaily)  
 This fork creates a heavily tested fixed and changed spinoff version based on [rambros3d/disco-reaper](https://github.com/rambros3d/disco-reaper) which adds QoL features, fixes bugs previously present in code, and creates a larger backup scope.
@@ -12,13 +12,22 @@ This fork creates a heavily tested fixed and changed spinoff version based on [r
 
 _**MR** = Multi Run | **SR** = Single Run_ | Disclaimer: All fixes & tests apply only to Fluxer. 
 
+### This repository's version comes with an AGPLv3 license.
+  * The original code states "Take it, use it, modify it, feel free to do whatever you wish.", therefore, I will do whatever I wish and license it with the restriction that all iterations from this point—using this repository's versions past V4-Main original fork point commit:`e9450ed`—onwards MUST also contribute their modifications back to the public. 
+  * If the original author has a problem with this I will remove said license.
+  
+* What that means for this repository:  
+
+| ACTION | ALLOWED? | CONDITION | SCOPE FOR THIS REPOSITORY |
+| :--- | :---: | :---: |  :---: |
+| COPY/MODIFY/USE source code for personal use | ✅ ALLOWED | All code is provided free of charge for anyone to read or modify | ALL FILES |
+| Modify the code in this repository for commercial use | ☑️ ALLOWED (!) | (!) All changes must also be published with this license. | ALL FILES AFTER COMMIT:`e9450ed` |
+| Use the code in this repository to provide a service | ☑️ ALLOWED (!) | (!) A direct link to this repository (if using this code) must be provided. | ALL FILES AFTER COMMIT:`e9450ed` |
+| Direct resale of this code | ☑️ ALLOWED (!) | (!) A direct link to this repository (if using this repo's source code) must be provided. | ALL FILES AFTER COMMIT:`e9450ed` | 
+* All files after commit `e9450ed` means all files in this repository that have been modified after sourced from this repository, **if your source code is based on the original ([rambros3d/disco-reaper](https://github.com/rambros3d/disco-reaper)) repository this does NOT apply to you.**
 
 ### CHANGELOG:  
 BASED ON [rambros3d/disco-reaper](https://github.com/rambros3d/disco-reaper):V4-main commit:[`2d33b16`](https://github.com/rambros3d/disco-reaper/commit/2d33b16d2c09098a3a1648dc15fc8abaee92b977), this repository will likely not update the source past this version.
-
-* Added an AGPLv3 license.
-  * The original code states "Take it, use it, modify it, feel free to do whatever you wish.", therefore, I will do whatever I wish and license it with the restriction that all iterations from this point—using this repository's versions past V4-Main original fork point commit:`e9450ed`—onwards MUST also contribute their modifications back to the public. 
-  * If the original author has a problem with this I will said license.
 
 #### IMPORTED FROM BRANCH: `ratelimit-fix` (COMMIT: `e9450ed`).  
 1. FIXED: Messages marked as migrated when they were never delivered (Fluxer)
@@ -213,11 +222,10 @@ But now their own website states that **Persona** will be used in some countries
 ### Documentation
 - [![Website](https://img.shields.io/badge/Website-rambros3d.com-blue?style=flat&logo=googlechrome&logoColor=white)](https://reaper.rambros3d.com/) - view bot setup guides, tool usage guides, and backup viewer
 - [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rambros3d/disco-reaper) - incredibily good AI docs
+- [![Ask DeepWiki (luaily's version)](https://deepwiki.com/badge.svg)](https://deepwiki.com/luaily/disco-reaper)
+
 
 ### Vibe Code Notice
 
 - Code is provided as is; This tool was developed with AI.
 - Take it, use it, modify it, feel free to do whatever you wish.
-
-
-[![Star History Chart](https://api.star-history.com/image?repos=rambros3d/disco-reaper&type=date&legend=top-left)](https://www.star-history.com/?repos=rambros3d%2Fdisco-reaper&type=date&legend=top-left)
